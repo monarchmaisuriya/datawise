@@ -1,6 +1,6 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { FlatList, Icon, Modal as HostModal, type ModalContentProps, type ModalProps, TextInput } from "@getpaseo/plugin/client/ui";
+import { FlatList, Icon, Modal as HostModal, type ModalContentProps, type ModalProps, ScrollView, TextInput } from "@getpaseo/plugin/client/ui";
 import { createContext, type ReactNode, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
 import { PendingContext } from "./pending";
@@ -30,7 +30,7 @@ function buildStyles(theme: Theme, compact: boolean) {
     input: { borderWidth: 1, borderColor: c.border, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 7, fontSize: 13, color: c.foreground, backgroundColor: c.surface1 },
     card: { borderWidth: 1, borderColor: c.border, borderRadius: 8, backgroundColor: c.surface1, padding: 12, gap: 8 },
     divider: { height: 1, backgroundColor: c.border },
-    toolbar: { flexDirection: "row" as const, flexWrap: "wrap" as const, alignItems: "center" as const, gap: 6, padding: 8, borderBottomWidth: 1, borderBottomColor: c.border },
+    toolbar: { flexDirection: "row" as const, flexWrap: "wrap" as const, alignItems: "center" as const, gap: 4, paddingHorizontal: 8, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: c.border },
   };
 }
 export type Styles = ReturnType<typeof buildStyles>;
@@ -147,28 +147,35 @@ export function connectionColorValue(colors: Theme["colors"], color: ConnectionC
   return { red: colors.statusDanger, amber: colors.statusWarning, green: colors.statusSuccess, gray: colors.foregroundMuted, contrast: colors.foreground }[color];
 }
 
-export function Btn({ label, icon, onPress, kind = "ghost", disabled = false }: { label?: string; icon?: string; onPress: () => void; kind?: "primary" | "ghost" | "danger"; disabled?: boolean }) {
+// An icon-only button must say what it does, because a screen reader has nothing else to read.
+type BtnName = { label: string; title?: string } | { label?: undefined; title: string };
+
+// Only "primary" is filled with the accent color, so the accent always means the main action of a view.
+export function Btn({ label, title, icon, onPress, kind = "ghost", disabled = false, on = false }: BtnName & { icon?: string; onPress: () => void; kind?: "primary" | "ghost" | "danger"; disabled?: boolean; on?: boolean }) {
   const ui = useUi();
   const c = ui.colors;
-  const fg = kind === "primary" ? c.accentForeground : kind === "danger" ? c.statusDanger : c.foreground;
+  const [hovered, setHovered] = useState(false);
+  const fg = kind === "primary" ? c.accentForeground : kind === "danger" ? c.statusDanger : label || on ? c.foreground : c.foregroundMuted;
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={label ?? icon}
-      accessibilityState={{ disabled }}
+      accessibilityLabel={title ?? label}
+      accessibilityState={{ disabled, selected: on }}
+      aria-selected={on}
       disabled={disabled}
       onPress={onPress}
+      onHoverIn={() => setHovered(true)}
+      onHoverOut={() => setHovered(false)}
       style={({ pressed }) => ({
         flexDirection: "row",
         alignItems: "center",
         justifyContent: "center",
         gap: 6,
         minHeight: ui.compact ? 36 : 30,
-        paddingHorizontal: label ? 10 : 7,
+        minWidth: ui.compact ? 36 : 30,
+        paddingHorizontal: label ? 10 : 6,
         borderRadius: 6,
-        borderWidth: kind === "primary" ? 0 : 1,
-        borderColor: kind === "danger" ? c.statusDanger : c.border,
-        backgroundColor: kind === "primary" ? c.accent : pressed ? c.surface2 : "transparent",
+        backgroundColor: kind === "primary" ? c.accent : on || pressed || (hovered && !disabled) ? c.surface2 : "transparent",
         opacity: disabled ? 0.45 : 1,
       })}
     >
@@ -185,20 +192,132 @@ export function Chip({ label, on, onPress, disabled = false }: { label: string; 
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ selected: on, disabled }}
+      aria-selected={on}
       disabled={disabled}
       onPress={onPress}
-      style={{ minHeight: ui.compact ? 32 : 26, justifyContent: "center", paddingHorizontal: 10, borderRadius: 999, borderWidth: 1, borderColor: on ? c.accent : c.border, backgroundColor: on ? c.accent : "transparent", opacity: disabled ? 0.45 : 1 }}
+      style={{ minHeight: ui.compact ? 32 : 24, justifyContent: "center", paddingHorizontal: 9, borderRadius: 6, borderWidth: 1, borderColor: on ? c.surface2 : c.border, backgroundColor: on ? c.surface2 : "transparent", opacity: disabled ? 0.45 : 1 }}
     >
-      <Text style={{ fontSize: 12, color: on ? c.accentForeground : c.foregroundMuted }}>{label}</Text>
+      <Text style={{ fontSize: 12, color: on ? c.foreground : c.foregroundMuted, fontWeight: on ? "500" : "400" }}>{label}</Text>
     </Pressable>
   );
 }
 
-export function Field({ label, hint, value, onChangeText, placeholder, secure = false, multiline = false, mono = false, editable = true }: { label: string; hint?: string; value: string; onChangeText: (text: string) => void; placeholder?: string; secure?: boolean; multiline?: boolean; mono?: boolean; editable?: boolean }) {
+// One choice out of a few, shown together. Choices with a consequence stay visible this way.
+export function Segmented<Value extends string>({ label, value, options, onChange }: { label: string; value: Value; options: { label: string; value: Value }[]; onChange: (value: Value) => void }) {
+  const ui = useUi();
+  const c = ui.colors;
+  return (
+    <View accessibilityRole="radiogroup" accessibilityLabel={label} style={{ flexDirection: "row", flexWrap: "wrap", alignSelf: "flex-start", maxWidth: "100%", padding: 2, gap: 2, borderRadius: 7, backgroundColor: c.surface2 }}>
+      {options.map((option) => {
+        const on = option.value === value;
+        return (
+          <Pressable key={option.value} accessibilityRole="radio" accessibilityLabel={option.label} accessibilityState={{ checked: on }} aria-checked={on} onPress={() => onChange(option.value)} style={{ minHeight: ui.compact ? 32 : 24, justifyContent: "center", paddingHorizontal: 9, borderRadius: 5, backgroundColor: on ? c.surface0 : "transparent" }}>
+            <Text style={{ fontSize: 12, color: on ? c.foreground : c.foregroundMuted, fontWeight: on ? "500" : "400" }}>{option.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+// A group of settings that opens on press. Its value shows while closed, so nothing is hidden silently.
+export function Section({ title, value, warn = false, children }: { title: string; value: string; warn?: boolean; children: ReactNode }) {
+  const ui = useUi();
+  const [open, setOpen] = useState(false);
+  return (
+    <View style={{ borderTopWidth: 1, borderTopColor: ui.colors.border }}>
+      <Pressable accessibilityRole="button" accessibilityLabel={`${title}: ${value}`} accessibilityState={{ expanded: open }} aria-expanded={open} onPress={() => setOpen((current) => !current)} style={[ui.row, { minHeight: 40 }]}>
+        <Text style={[ui.body, { fontWeight: "500" }]}>{title}</Text>
+        <Text numberOfLines={1} style={[warn ? ui.warning : ui.muted, { flex: 1, textAlign: "right" }]}>
+          {value}
+        </Text>
+        <Icon name={open ? "ChevronUp" : "ChevronDown"} size={14} color={ui.colors.foregroundMuted} />
+      </Pressable>
+      {open ? <View style={{ gap: 12, paddingBottom: 14 }}>{children}</View> : null}
+    </View>
+  );
+}
+
+// A small status label. `detail` is what a screen reader hears, when the short text leaves something out.
+export function Pill({ text, kind = "neutral", detail }: { text: string; kind?: "neutral" | "warning" | "danger"; detail?: string }) {
+  const ui = useUi();
+  const c = ui.colors;
+  const color = kind === "danger" ? c.statusDanger : kind === "warning" ? c.statusWarning : c.foregroundMuted;
+  return (
+    <View accessible accessibilityLabel={detail ?? text} style={{ flexShrink: 0, maxWidth: "100%", paddingHorizontal: 6, paddingVertical: 1, borderRadius: 4, borderWidth: 1, borderColor: color }}>
+      <Text numberOfLines={1} style={{ fontSize: 11, color, fontWeight: kind === "danger" ? "600" : "500" }}>
+        {text}
+      </Text>
+    </View>
+  );
+}
+
+// Rarely used actions, one press further away.
+export interface MenuItem {
+  label: string;
+  icon: string;
+  detail?: string;
+  disabled?: boolean;
+  onPress: () => void;
+}
+
+export function MoreMenu({ title = "More actions", items }: { title?: string; items: MenuItem[] }) {
+  const ui = useUi();
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Btn icon="Ellipsis" title={title} onPress={() => setOpen(true)} />
+      <Modal title={title} open={open} onOpenChange={setOpen}>
+        <Modal.Content contentContainerStyle={{ padding: 8, gap: 0 }}>
+          {items.map((item) => (
+            <Pressable
+              key={item.label}
+              accessibilityRole="button"
+              accessibilityLabel={item.label}
+              accessibilityState={{ disabled: item.disabled === true }}
+              disabled={item.disabled}
+              onPress={() => {
+                setOpen(false);
+                item.onPress();
+              }}
+              style={({ pressed }) => [ui.row, { gap: 10, padding: 10, borderRadius: 6, backgroundColor: pressed ? ui.colors.surface2 : "transparent", opacity: item.disabled ? 0.45 : 1 }]}
+            >
+              <Icon name={item.icon} size={15} color={ui.colors.foregroundMuted} />
+              <View style={{ flex: 1, gap: 1 }}>
+                <Text style={ui.body}>{item.label}</Text>
+                {item.detail ? <Text style={ui.muted}>{item.detail}</Text> : null}
+              </View>
+            </Pressable>
+          ))}
+        </Modal.Content>
+      </Modal>
+    </>
+  );
+}
+
+// A dialog body that scrolls while its footer stays in view. Use inside Modal.Content with scrollable={false}.
+export function PinnedFooter({ footer, children }: { footer: ReactNode; children: ReactNode }) {
+  const ui = useUi();
+  return (
+    <View style={{ flex: 1, minHeight: 0 }}>
+      <ScrollView style={{ flex: 1, minHeight: 0 }} keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 16, gap: 12 }}>
+        {children}
+      </ScrollView>
+      <View style={{ paddingHorizontal: 16, paddingVertical: 10, gap: 8, borderTopWidth: 1, borderTopColor: ui.colors.border }}>
+        {footer}
+      </View>
+    </View>
+  );
+}
+
+export function Field({ label, labelAction, hint, value, onChangeText, placeholder, secure = false, multiline = false, mono = false, editable = true }: { label: string; labelAction?: ReactNode; hint?: string; value: string; onChangeText: (text: string) => void; placeholder?: string; secure?: boolean; multiline?: boolean; mono?: boolean; editable?: boolean }) {
   const ui = useUi();
   return (
     <View style={{ gap: 4 }}>
-      <Text style={ui.label}>{label}</Text>
+      <View style={[ui.row, { justifyContent: "space-between" }]}>
+        <Text style={[ui.label, { flexShrink: 1 }]}>{label}</Text>
+        {labelAction}
+      </View>
       <TextInput
         accessibilityLabel={label}
         value={value}
@@ -227,38 +346,42 @@ export function Message({ kind, text }: { kind: "error" | "warning" | "success" 
   );
 }
 
+// Above this many, a list is drawn lazily, and the host then gives the dialog a fixed height.
+const LONG_LIST = 40;
+
 // A press-to-open list that works the same on phone and desktop. There is no shared native picker.
-export function Select({ label, value, options, onChange, placeholder = "Choose" }: { label: string; value: string; options: { label: string; value: string }[]; onChange: (value: string) => void; placeholder?: string }) {
+export function Select({ label, value, options, onChange, placeholder = "Choose" }: { label: string; value: string; options: { label: string; value: string; detail?: string }[]; onChange: (value: string) => void; placeholder?: string }) {
   const ui = useUi();
   const [open, setOpen] = useState(false);
   const shown = options.find((option) => option.value === value)?.label ?? placeholder;
+  const renderOption = (item: (typeof options)[number]) => (
+    <Pressable
+      key={item.value}
+      accessibilityRole="button"
+      accessibilityState={{ selected: item.value === value }}
+      onPress={() => {
+        // Choosing the current value is not a change, and a handler may reset other fields on a change.
+        if (item.value !== value) onChange(item.value);
+        setOpen(false);
+      }}
+      style={({ pressed }) => ({ paddingHorizontal: 14, paddingVertical: 10, gap: 1, backgroundColor: item.value === value || pressed ? ui.colors.surface2 : "transparent" })}
+    >
+      <Text style={ui.body}>{item.label}</Text>
+      {item.detail ? <Text style={ui.muted}>{item.detail}</Text> : null}
+    </Pressable>
+  );
+  const long = options.length > LONG_LIST;
   return (
     <>
-      <Pressable accessibilityRole="button" accessibilityLabel={`${label}: ${shown}`} onPress={() => setOpen(true)} style={[ui.input, { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6, minWidth: 90 }]}>
+      <Pressable accessibilityRole="button" accessibilityLabel={`${label}: ${shown}`} onPress={() => setOpen(true)} style={[ui.input, { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6, minWidth: 0 }]}>
         <Text numberOfLines={1} style={[ui.body, { flexShrink: 1 }]}>
           {shown}
         </Text>
         <Icon name="ChevronDown" size={13} color={ui.colors.foregroundMuted} />
       </Pressable>
       <Modal title={label} open={open} onOpenChange={setOpen}>
-        <Modal.Content scrollable={false} contentContainerStyle={{ padding: 0, gap: 0 }}>
-          <FlatList
-            style={{ flex: 1, minHeight: 0 }}
-            data={options}
-            keyExtractor={(option) => option.value}
-            renderItem={({ item }) => (
-              <Pressable
-                accessibilityRole="button"
-                onPress={() => {
-                  onChange(item.value);
-                  setOpen(false);
-                }}
-                style={{ padding: 14, borderBottomWidth: 1, borderBottomColor: ui.colors.border, backgroundColor: item.value === value ? ui.colors.surface2 : "transparent" }}
-              >
-                <Text style={ui.body}>{item.label}</Text>
-              </Pressable>
-            )}
-          />
+        <Modal.Content scrollable={!long} contentContainerStyle={{ padding: 0, gap: 0 }}>
+          {long ? <FlatList style={{ flex: 1, minHeight: 0 }} data={options} keyExtractor={(option) => option.value} renderItem={({ item }) => renderOption(item)} /> : options.map(renderOption)}
         </Modal.Content>
       </Modal>
     </>

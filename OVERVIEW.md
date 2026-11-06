@@ -21,7 +21,7 @@ PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elast
 
 Each connection has a write mode. **Ask first** is the default: every change shows what it will do and waits. **Read-only** refuses writes. **No prompts** runs them directly. Deleting or emptying an object always needs its name typed.
 
-A connection labelled production cannot use No prompts, shows a banner on every tab, and cannot be shared with agents. The server enforces this. The label is yours to set: Datawise does not guess it from a host name, so an unlabelled production database has no such protection.
+A connection labelled production cannot use No prompts, shows a Production label on every tab, and cannot be shared with agents. The server enforces this. The label is yours to set: Datawise does not guess it from a host name, so an unlabelled production database has no such protection.
 
 Read-only is strong but not absolute. Datawise refuses anything it cannot prove is a read and, on most engines, also opens a read-only session. Even so, a function called from a `SELECT` can reach outside what either check sees, such as `dblink_exec` on PostgreSQL. In Ask first mode, such a function runs without a prompt. For a production database, the only full guarantee is a database user without write rights.
 

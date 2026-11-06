@@ -4,6 +4,23 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-06
+
+### Changed
+
+- A calmer interface throughout. The green accent now marks only the main action of a view, buttons have no borders, and the grid has no vertical lines. No feature was removed, and nothing changed on the server or in saved files.
+- Connection form: essentials first, with a picker for the database type. Security (encryption and SSH), Agents, and Color and group are sections that show their current value while closed. Test and Save stay in view. Environment, write mode and password storage stay in the first view.
+- Data tab: the toolbar fits one row. Count, Import, Export and Copy as Markdown moved to the More menu. Row checkboxes appear after pressing Select or Edit cells.
+- Query tab: the time and row limits moved to a Limits dialog. The note about how statements run shows only when the text runs past one line or one statement. Close is on the open tab.
+- Production, Read-only and Not encrypted are now small labels beside the title, not full-width rows. Production still shows on every tab.
+- Icon-only buttons now have plain names for screen readers.
+
+### Fixed
+
+- Choosing the database type a connection already has no longer clears its port.
+- The object list no longer says nothing was found while it is still waiting for the database list.
+- A connection switched from a session-only password to an engine with no password no longer asks for a password.
+
 ## [0.3.0] - 2026-11-06
 
 ### Added

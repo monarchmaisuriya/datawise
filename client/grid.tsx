@@ -45,7 +45,7 @@ const GridRow = memo(function GridRow({ row, index, names, sizes, positions, cut
   const padding = ui.compact ? (density === "compact" ? 6 : 10) : density === "compact" ? 3 : 6;
   const cells = positions.map((position) => {
     const cell = row[position];
-    const style = { width: sizes[position], paddingHorizontal: 8, paddingVertical: padding, borderRightWidth: 1, borderRightColor: c.border, backgroundColor: edited?.has(position) ? c.surface2 : "transparent" };
+    const style = { width: sizes[position], paddingHorizontal: 8, paddingVertical: padding, backgroundColor: edited?.has(position) ? c.surface2 : "transparent" };
     const label = (
       <Text numberOfLines={1} style={{ fontFamily: MONO, fontSize: 12, color: cell === null ? c.foregroundMuted : c.foreground, fontStyle: cell === null ? "italic" : "normal", textDecorationLine: deleted ? "line-through" : "none" }}>
         {cell === null ? nullText : cellText(cell)}
@@ -66,7 +66,7 @@ const GridRow = memo(function GridRow({ row, index, names, sizes, positions, cut
     <View style={{ flexDirection: "row", borderBottomWidth: 1, borderBottomColor: c.border, backgroundColor: selected ? c.surface2 : "transparent" }}>
       {selectable ? (
         <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: selected }} accessibilityLabel={`Select row ${index + 1}`} onPress={() => onToggle?.(index)} style={{ width: CHECK_WIDTH, alignItems: "center", justifyContent: "center" }}>
-          <Icon name={selected ? "SquareCheck" : "Square"} size={15} color={selected ? c.accent : c.foregroundMuted} />
+          <Icon name={selected ? "SquareCheck" : "Square"} size={15} color={selected ? c.foreground : c.foregroundMuted} />
         </Pressable>
       ) : null}
       {onCellPress ? (
@@ -107,12 +107,12 @@ export function Grid({ columns, rows, cutCells, sort, onSort, onRowPress, select
             if (!column) return null;
             const sorted = sort?.column === column.name;
             return (
-              <Pressable key={column.name} accessibilityRole="button" accessibilityLabel={onSort ? `Sort by ${column.name}` : column.name} disabled={!onSort} onPress={() => onSort?.(column.name)} style={{ width: sizes[position], flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 7, borderRightWidth: 1, borderRightColor: c.border }}>
+              <Pressable key={column.name} accessibilityRole="button" accessibilityLabel={onSort ? `Sort by ${column.name}` : column.name} disabled={!onSort} onPress={() => onSort?.(column.name)} style={{ width: sizes[position], flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 7 }}>
                 {column.isKey ? <Icon name="KeyRound" size={11} color={c.statusWarning} /> : null}
                 <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 12, fontWeight: "600", color: c.foreground }}>
                   {column.name}
                 </Text>
-                {sorted ? <Icon name={sort?.descending ? "ArrowDown" : "ArrowUp"} size={11} color={c.accent} /> : null}
+                {sorted ? <Icon name={sort?.descending ? "ArrowDown" : "ArrowUp"} size={11} color={c.foreground} /> : null}
               </Pressable>
             );
           })}

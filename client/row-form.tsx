@@ -6,7 +6,7 @@ import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowK
 import { ENGINES } from "../shared/engines";
 import { jumpFilters } from "../shared/foreign-keys";
 import { parseEdited } from "../shared/values";
-import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, useApi, useGuardedRun, useUi } from "./kit";
+import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, PinnedFooter, useApi, useGuardedRun, useUi } from "./kit";
 
 export type RowFormMode = { kind: "insert"; values?: Record<string, unknown> } | { kind: "edit"; key: RowKey; row: unknown[]; hasCutCells: boolean };
 
@@ -120,9 +120,34 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
     return filters ? [{ key, filters }] : [];
   }) : [];
 
+  const footer = (
+    <View style={[ui.row, { justifyContent: "space-between", flexWrap: "wrap" }]}>
+      <View style={[ui.row, { gap: 2 }]}>
+        {editing && editable ? <Btn label="Delete" kind="danger" disabled={busy} onPress={() => void write({ kind: "delete", keys: [(mode as { key: RowKey }).key] })} /> : null}
+        {editing && canWrite && info.canInsertRows ? <Btn label="Duplicate" disabled={busy} onPress={() => onDuplicate(asObject())} /> : null}
+        {editing ? (
+          <Btn
+            label="Copy"
+            onPress={() =>
+              void copyText(JSON.stringify(asObject(), null, 2)).then(
+                () => toast.show("Copied", { variant: "success" }),
+                () => toast.error("Could not copy."),
+              )
+            }
+          />
+        ) : null}
+      </View>
+      <View style={[ui.row, { gap: 2 }]}>
+        <Btn label="Close" onPress={onClose} />
+        {editable ? <Btn label={busy ? "Saving…" : "Save"} kind="primary" disabled={busy || (editing && !shownRow)} onPress={save} /> : null}
+      </View>
+    </View>
+  );
+
   return (
     <Modal title={title} open onOpenChange={(open) => (open ? undefined : onClose())}>
-      <Modal.Content>
+      <Modal.Content scrollable={false} contentContainerStyle={{ padding: 0, gap: 0 }}>
+        <PinnedFooter footer={error ? <><Message kind="error" text={error} />{footer}</> : footer}>
         {editing && keyColumns.length === 0 ? <Message kind="warning" text={keyReason ?? "This row cannot be changed from here."} /> : null}
         {!canWrite ? <Message kind="note" text="This connection is read-only." /> : null}
         {full.isLoading ? <Message kind="note" text="Loading the whole row…" /> : null}
@@ -135,6 +160,7 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
           return (
             <View key={name} style={{ gap: 3 }}>
               <Field
+                labelAction={!locked && column?.nullable !== false ? <Chip label="NULL" on={state.isNull} onPress={() => update(name, { isNull: !state.isNull })} /> : undefined}
                 label={`${name}${column?.type ? `  ·  ${column.type}` : ""}${column?.isKey ? "  ·  key" : ""}`}
                 value={state.isNull ? "" : state.text}
                 onChangeText={(text) => update(name, { text, isNull: false })}
@@ -143,11 +169,6 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
                 mono
                 editable={!locked}
               />
-              {!locked && column?.nullable !== false ? (
-                <View style={ui.wrap}>
-                  <Chip label="NULL" on={state.isNull} onPress={() => update(name, { isNull: !state.isNull })} />
-                </View>
-              ) : null}
             </View>
           );
         })}
@@ -179,30 +200,8 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
             </View>
           </View>
         ) : null}
-        {error ? <Message kind="error" text={error} /> : null}
-        <View style={[ui.row, { justifyContent: "space-between", flexWrap: "wrap" }]}>
-          <View style={ui.row}>
-            {editing && editable ? <Btn label="Delete" kind="danger" disabled={busy} onPress={() => void write({ kind: "delete", keys: [(mode as { key: RowKey }).key] })} /> : null}
-            {editing && canWrite && info.canInsertRows ? <Btn label="Duplicate" disabled={busy} onPress={() => onDuplicate(asObject())} /> : null}
-            {editing ? (
-              <Btn
-                icon="Copy"
-                label="Copy"
-                onPress={() =>
-                  void copyText(JSON.stringify(asObject(), null, 2)).then(
-                    () => toast.show("Copied", { variant: "success" }),
-                    () => toast.error("Could not copy."),
-                  )
-                }
-              />
-            ) : null}
-          </View>
-          <View style={ui.row}>
-            <Btn label="Close" onPress={onClose} />
-            {editable ? <Btn label={busy ? "Saving…" : "Save"} kind="primary" disabled={busy || (editing && !shownRow)} onPress={save} /> : null}
-          </View>
-        </View>
         {editing && editable ? <Text style={ui.muted}>Last write wins: a change someone else made to the same value since this page loaded is replaced.</Text> : null}
+        </PinnedFooter>
       </Modal.Content>
     </Modal>
   );

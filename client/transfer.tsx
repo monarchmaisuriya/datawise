@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import type { ConnectionView, ExportFormat, ExportSource, ImportFormat, JobView, ObjectRef } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
-import { Btn, cellText, Chip, errorText, Field, Message, Modal, Select, useApi, useGuardedRun, useUi, waitForJob } from "./kit";
+import { Btn, cellText, errorText, Field, Message, Modal, Segmented, Select, useApi, useGuardedRun, useUi, waitForJob } from "./kit";
 import { usePreferences } from "./preferences";
 
 const EXPORT_FORMATS: { value: ExportFormat; label: string }[] = [
@@ -58,11 +58,7 @@ export function ExportModal({ connection, source, name, onClose }: { connection:
       <Modal.Content>
         <View style={{ gap: 4 }}>
           <Text style={ui.label}>Format</Text>
-          <View style={ui.wrap}>
-            {formats.map((item) => (
-              <Chip key={item.value} label={item.label} on={format === item.value} onPress={() => setFormat(item.value)} />
-            ))}
-          </View>
+          <Segmented label="Format" value={format} options={formats} onChange={setFormat} />
         </View>
         <Field label="File on the daemon machine" value={path} onChangeText={setPath} mono hint="An existing file is never replaced." />
         {job ? (
@@ -158,17 +154,12 @@ export function ImportModal({ connection, refObject, columns, onClose, onDone }:
   return (
     <Modal title={`Import into ${refObject.name}`} open onOpenChange={(open) => (open ? undefined : onClose())}>
       <Modal.Content>
-        <View style={ui.wrap}>
-          <Chip label="Paste" on={sourceKind === "text"} onPress={() => setSourceKind("text")} />
-          <Chip label="File on the daemon machine" on={sourceKind === "path"} onPress={() => setSourceKind("path")} />
-        </View>
-        <View style={ui.wrap}>
-          {IMPORT_FORMATS.map((item) => (
-            <Chip key={item.value} label={item.label} on={format === item.value} onPress={() => setFormat(item.value)} />
-          ))}
-        </View>
+        <Segmented label="Source" value={sourceKind} options={[{ label: "Paste", value: "text" as const }, { label: "File on the daemon machine", value: "path" as const }]} onChange={setSourceKind} />
+        <Segmented label="Format" value={format} options={IMPORT_FORMATS} onChange={setFormat} />
         <Field label={sourceKind === "text" ? "Data" : "Full path"} value={value} onChangeText={setValue} multiline={sourceKind === "text"} mono />
-        <Btn label="Preview" disabled={value.trim() === ""} onPress={() => void loadPreview()} />
+        <View style={{ alignSelf: "flex-start" }}>
+          <Btn icon="Eye" label="Preview" disabled={value.trim() === ""} onPress={() => void loadPreview()} />
+        </View>
         {preview ? (
           <View style={{ gap: 8 }}>
             <Text style={ui.muted}>
@@ -199,10 +190,7 @@ export function ImportModal({ connection, refObject, columns, onClose, onDone }:
               </View>
             ))}
             {format === "csv" || format === "tsv" ? (
-              <View style={ui.wrap}>
-                <Chip label="Empty cell is NULL" on={emptyIsNull} onPress={() => setEmptyIsNull(true)} />
-                <Chip label="Empty cell is empty text" on={!emptyIsNull} onPress={() => setEmptyIsNull(false)} />
-              </View>
+              <Segmented label="Empty cells" value={emptyIsNull ? "null" : "text"} options={[{ label: "Empty cell is NULL", value: "null" }, { label: "Empty cell is empty text", value: "text" }]} onChange={(next) => setEmptyIsNull(next === "null")} />
             ) : null}
             <Text style={ui.muted}>{info.transactionalImport ? "All or nothing: if a row fails, no rows are kept." : `${info.label} has no multi-row transaction here: if a row fails, rows before it stay.`}</Text>
           </View>

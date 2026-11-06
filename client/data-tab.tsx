@@ -10,7 +10,7 @@ import { rowId, toEdits } from "../shared/staging";
 import { parseEdited } from "../shared/values";
 import { dropMissingColumns, visiblePositions } from "../shared/view-columns";
 import { Grid } from "./grid";
-import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, Select, useApi, useConfirm, useGuardedRun, useUi, waitForJob } from "./kit";
+import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, MoreMenu, Section, Select, useApi, useConfirm, useGuardedRun, useUi, waitForJob } from "./kit";
 import { usePending } from "./pending";
 import { usePreferences } from "./preferences";
 import { RowForm, type RowFormMode } from "./row-form";
@@ -76,6 +76,8 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   const [cellEdit, setCellEdit] = useState<{ key: RowKey; column: ColumnInfo; stored: unknown; current: unknown } | null>(null);
   // Coming back to a table with pending edits continues them.
   const [editingCells, setEditingCells] = useState(staged.size > 0);
+  // Checkboxes show only while they can be used, so a table being read has none.
+  const [selecting, setSelecting] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
   const [columnsOpen, setColumnsOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -248,6 +250,15 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   const selectedIndexes = new Set((data?.rows ?? []).flatMap((row, index) => (data && selected.has(JSON.stringify(keyOf(data, row))) ? [index] : [])));
   const canSelect = data !== undefined && data.keyColumns.length > 0 && info.canEditRows && connection.safety !== "read-only";
   const canStage = canSelect && info.transactionalEdits;
+  const checking = selecting || editingCells;
+  const toggleSelecting = () => {
+    setSelecting((on) => !on);
+    setSelected(new Map());
+  };
+  const toggleEditing = () => {
+    setEditingCells((on) => !on);
+    setSelected(new Map());
+  };
   // A position is a row offset on most engines. On the rest it is an opaque token, with no number to show.
   const start = cursor === null ? 0 : /^\d+$/.test(cursor) ? Number(cursor) : null;
   const rowsLabel = data ? `${data.rows.length === 0 ? "No rows" : start !== null ? `Rows ${start + 1}–${start + data.rows.length}` : `${data.rows.length} rows`}${data.truncated ? " (page cut for size; Next continues)" : ""}` : "";
@@ -255,17 +266,26 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
 
   return (
     <View style={{ flex: 1, minHeight: 0 }}>
-      <View style={ui.toolbar}>
-        <Btn icon="RefreshCw" onPress={refresh} />
-        <Btn icon="ListFilter" label={filters.length > 0 ? `Filter (${filters.length})` : "Filter"} onPress={() => setFilterOpen(true)} />
-        <Btn icon="Columns3" label={hiddenColumns.length > 0 ? `Columns (${hiddenColumns.length} hidden)` : "Columns"} disabled={!data} onPress={() => setColumnsOpen(true)} />
-        {info.canInsertRows && connection.safety !== "read-only" ? <Btn icon="Plus" label="Row" onPress={() => setForm({ kind: "insert" })} /> : null}
-        {canStage ? <Chip label="Edit cells" on={editingCells} onPress={() => setEditingCells((on) => !on)} /> : null}
-        {selected.size > 0 ? <Btn icon="Trash2" label={editingCells ? `Mark ${selected.size} for delete` : `Delete ${selected.size}`} kind="danger" disabled={committing} onPress={() => void removeSelected()} /> : null}
-        <Btn icon="Hash" label={count ?? "Count"} onPress={() => void countRows()} />
-        <Btn icon="Upload" label="Import" disabled={connection.safety === "read-only"} onPress={() => setImporting(true)} />
-        <Btn icon="Download" label="Export" onPress={() => setExporting(true)} />
-        <Btn icon="ClipboardCopy" label="Copy as Markdown" disabled={!data || data.rows.length === 0} onPress={copyPage} />
+      <View style={[ui.toolbar, { justifyContent: "space-between" }]}>
+        <View style={[ui.wrap, { gap: 2 }]}>
+          <Btn icon="ListFilter" title={filters.length > 0 ? `Filter, ${filters.length} on` : "Filter"} label={ui.compact ? (filters.length > 0 ? String(filters.length) : undefined) : filters.length > 0 ? `Filter (${filters.length})` : "Filter"} on={filters.length > 0} onPress={() => setFilterOpen(true)} />
+          <Btn icon="Columns3" title={hiddenColumns.length > 0 ? `Columns, ${hiddenColumns.length} hidden` : "Columns"} label={ui.compact ? (hiddenColumns.length > 0 ? String(hiddenColumns.length) : undefined) : hiddenColumns.length > 0 ? `Columns (${hiddenColumns.length} hidden)` : "Columns"} on={hiddenColumns.length > 0} disabled={!data} onPress={() => setColumnsOpen(true)} />
+        </View>
+        <View style={[ui.wrap, { gap: 2 }]}>
+          {selected.size > 0 ? <Btn icon="Trash2" title={editingCells ? `Mark ${selected.size} for delete` : `Delete ${selected.size}`} label={ui.compact ? String(selected.size) : editingCells ? `Mark ${selected.size} for delete` : `Delete ${selected.size}`} kind="danger" disabled={committing} onPress={() => void removeSelected()} /> : null}
+          {info.canInsertRows && connection.safety !== "read-only" ? <Btn icon="Plus" title="Add row" label={ui.compact ? undefined : "Row"} onPress={() => setForm({ kind: "insert" })} /> : null}
+          {canSelect ? <Btn icon="SquareCheck" title="Select rows" label={ui.compact ? undefined : "Select"} on={checking} disabled={editingCells} onPress={toggleSelecting} /> : null}
+          {canStage ? <Btn icon="Pencil" title="Edit cells" label={ui.compact ? undefined : "Edit cells"} on={editingCells} onPress={toggleEditing} /> : null}
+          <Btn icon="RefreshCw" title="Refresh rows" onPress={refresh} />
+          <MoreMenu
+            items={[
+              { label: "Count rows", icon: "Hash", detail: filters.length > 0 ? "With the current filter" : undefined, onPress: () => void countRows() },
+              { label: "Import", icon: "Upload", detail: connection.safety === "read-only" ? "This connection is read-only" : undefined, disabled: connection.safety === "read-only", onPress: () => setImporting(true) },
+              { label: "Export", icon: "Download", onPress: () => setExporting(true) },
+              { label: "Copy page as Markdown", icon: "ClipboardCopy", disabled: !data || data.rows.length === 0, onPress: copyPage },
+            ]}
+          />
+        </View>
       </View>
       {staged.size > 0 ? (
         <View style={[ui.toolbar, { backgroundColor: ui.colors.surface1 }]}>
@@ -279,7 +299,7 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
       {droppedNote.length > 0 ? (
         <View style={[ui.row, { paddingHorizontal: 12 }]}>
           <Text style={[ui.muted, { flexShrink: 1 }]}>This table no longer has {droppedNote.join(", ")}, so the saved sort or filter on it was left out.</Text>
-          <Btn icon="X" onPress={() => setDroppedNote([])} />
+          <Btn icon="X" title="Dismiss" onPress={() => setDroppedNote([])} />
         </View>
       ) : null}
       {canSaveView ? null : <View style={{ paddingHorizontal: 12 }}><Message kind="warning" text="This table's saved view could not be read, so changes to columns, sort and filters are not being saved." /></View>}
@@ -297,7 +317,7 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
           deletedRows={overlay.deletedRows}
           sort={sort}
           onSort={info.canSort ? toggleSort : undefined}
-          selected={canSelect ? selectedIndexes : undefined}
+          selected={canSelect && checking ? selectedIndexes : undefined}
           onToggle={toggle}
           onCellPress={editingCells && canStage && !committing ? pressCell : undefined}
           onRowPress={(index) => {
@@ -309,7 +329,10 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
       {/* Keeps the paging row at the bottom when there is no grid above it. */}
       {data ? null : <View style={{ flex: 1 }} />}
       <View style={[ui.toolbar, { borderBottomWidth: 0, borderTopWidth: 1, borderTopColor: ui.colors.border, justifyContent: "space-between" }]}>
-        <Text style={ui.muted}>{rowsLabel}</Text>
+        <Text style={[ui.muted, { flexShrink: 1 }]}>
+          {rowsLabel}
+          {count ? ` · ${count}` : ""}
+        </Text>
         <View style={ui.row}>
           <Select
             label="Rows per page"
@@ -322,6 +345,7 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
           />
           <Btn
             icon="ChevronLeft"
+            title="Previous page"
             disabled={cursors.length <= 1}
             onPress={() => {
               setCursors((current) => current.slice(0, -1));
@@ -330,6 +354,7 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
           />
           <Btn
             icon="ChevronRight"
+            title="Next page"
             disabled={!data?.nextCursor}
             onPress={() => {
               const next = data?.nextCursor;
@@ -427,6 +452,7 @@ function CellModal({ column, stored, current, schemaless, onClose, onStage }: { 
       <Modal.Content>
         <Field
           label={column.type ?? "Value"}
+          labelAction={column.nullable !== false ? <Chip label="NULL" on={isNull} onPress={() => setIsNull((on) => !on)} /> : undefined}
           value={isNull ? "" : text}
           onChangeText={(next) => {
             setText(next);
@@ -436,11 +462,6 @@ function CellModal({ column, stored, current, schemaless, onClose, onStage }: { 
           multiline={text.length > 60}
           mono
         />
-        {column.nullable !== false ? (
-          <View style={ui.wrap}>
-            <Chip label="NULL" on={isNull} onPress={() => setIsNull((on) => !on)} />
-          </View>
-        ) : null}
         {error ? <Message kind="error" text={error} /> : null}
         <Text style={ui.muted}>This is added to the pending list. Nothing is written until you commit.</Text>
         <View style={[ui.row, { justifyContent: "flex-end" }]}>
@@ -477,8 +498,8 @@ function ColumnsModal({ names, hidden, visible, onClose, onChange }: { names: st
                 {name}
               </Text>
               <View style={ui.row}>
-                <Btn icon="ArrowUp" onPress={() => move(name, -1)} />
-                <Btn icon="ArrowDown" onPress={() => move(name, 1)} />
+                <Btn icon="ArrowUp" title={`Move ${name} up`} onPress={() => move(name, -1)} />
+                <Btn icon="ArrowDown" title={`Move ${name} down`} onPress={() => move(name, 1)} />
                 <Chip label={isHidden ? "Hidden" : "Shown"} on={!isHidden} disabled={!isHidden && shown.length === 1} onPress={() => onChange(isHidden ? hidden.filter((item) => item !== name) : [...hidden, name], order)} />
               </View>
             </View>
@@ -513,7 +534,7 @@ function FilterModal({ columns, ops, value, saved, onSaved, onClose, onApply }: 
                 </Text>
                 <View style={ui.row}>
                   <Btn label="Apply" disabled={!usable(item.filters)} onPress={() => onApply(item.filters)} />
-                  <Btn icon="Trash2" onPress={() => onSaved(saved.filter((other) => other.name !== item.name))} />
+                  <Btn icon="Trash2" title={`Delete saved filter ${item.name}`} onPress={() => onSaved(saved.filter((other) => other.name !== item.name))} />
                 </View>
               </View>
             ))}
@@ -528,7 +549,7 @@ function FilterModal({ columns, ops, value, saved, onSaved, onClose, onApply }: 
               <View style={{ flex: 1 }}>
                 <Select label="Condition" value={row.op} options={ops.map((op) => ({ label: FILTER_LABELS[op], value: op }))} onChange={(op) => patch(index, { op: op as FilterOp })} />
               </View>
-              <Btn icon="X" onPress={() => setRows((current) => current.filter((_, position) => position !== index))} />
+              <Btn icon="X" title="Remove this condition" onPress={() => setRows((current) => current.filter((_, position) => position !== index))} />
             </View>
             {row.op !== "null" && row.op !== "notnull" ? <Field label="Value" value={row.value} onChangeText={(next) => patch(index, { value: next })} mono /> : null}
           </View>
@@ -540,19 +561,21 @@ function FilterModal({ columns, ops, value, saved, onSaved, onClose, onApply }: 
             <Btn label="Apply" kind="primary" onPress={() => onApply(rows.filter((row) => row.column !== ""))} />
           </View>
         </View>
-        <View style={[ui.row, { alignItems: "flex-end" }]}>
-          <View style={{ flex: 1 }}>
-            <Field label="Save this filter as" hint="Saved values are kept in a file only your user can read." value={saveName} onChangeText={setSaveName} />
+        <Section title="Save this filter" value={saved.length > 0 ? `${saved.length} saved` : "None saved"}>
+          <View style={[ui.row, { alignItems: "flex-end" }]}>
+            <View style={{ flex: 1 }}>
+              <Field label="Save this filter as" hint="Saved values are kept in a file only your user can read." value={saveName} onChangeText={setSaveName} />
+            </View>
+            <Btn
+              label="Save"
+              disabled={saveName.trim() === "" || rows.every((row) => row.column === "")}
+              onPress={() => {
+                onSaved([...saved.filter((item) => item.name !== saveName.trim()), { name: saveName.trim(), filters: rows.filter((row) => row.column !== "") }]);
+                setSaveName("");
+              }}
+            />
           </View>
-          <Btn
-            label="Save"
-            disabled={saveName.trim() === "" || rows.every((row) => row.column === "")}
-            onPress={() => {
-              onSaved([...saved.filter((item) => item.name !== saveName.trim()), { name: saveName.trim(), filters: rows.filter((row) => row.column !== "") }]);
-              setSaveName("");
-            }}
-          />
-        </View>
+        </Section>
       </Modal.Content>
     </Modal>
   );

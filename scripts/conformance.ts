@@ -1172,6 +1172,14 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
   };
   const rowsName = `features-${key}-rows`;
   const rows = await rowsConnection(rowsName);
+  // Oracle refuses a read-only transaction for a few seconds after a table's definition changes (ORA-01466), and
+  // this run has just created the table. A read that keeps failing still fails the check below.
+  if (spec.engine === "oracle") {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (!(await useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope })).isError) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
   await lines.check("rows: reading works, marks rows untrusted, and records no values", async () => {
     await sql(`update ${spec.child} set ${spec.note} = 'PLANTED_AGENT_VALUE' where ${spec.id} = 2`);
     const answer = await useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope, filters: [{ column: spec.note, op: "contains", value: "PLANTED_FILTER" }] });

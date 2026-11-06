@@ -13,6 +13,8 @@ export interface Place {
 
 const KIND_ICONS: Record<string, string> = { table: "Table2", view: "Eye", "materialized view": "Eye", collection: "FileJson", index: "Search", label: "Tag", hash: "Hash", list: "List", set: "Braces", zset: "ListOrdered", string: "Type", stream: "Activity" };
 
+const PLACE_NAME_FITS = 14;
+
 export function ObjectTree({ connection, place, onPlace, selected, onSelect, onBack, onEdit, onQuery }: { connection: ConnectionView; place: Place; onPlace: (place: Place) => void; selected: string | null; onSelect: (object: ObjectInfo) => void; onBack: () => void; onEdit: () => void; onQuery: (text?: string) => void }) {
   const ui = useUi();
   const api = useApi();
@@ -48,28 +50,35 @@ export function ObjectTree({ connection, place, onPlace, selected, onSelect, onB
   });
   const items = objects.data?.pages.flatMap((page) => page.objects) ?? [];
   const error = databases.error ?? schemas.error ?? objects.error;
+  // Side by side a long name gets cut, and two similar names would then look the same.
+  const stackPlace = (database?.length ?? 0) > PLACE_NAME_FITS || (schema?.length ?? 0) > PLACE_NAME_FITS;
 
   return (
     <View style={{ flex: 1, minHeight: 0 }}>
       <View style={[ui.toolbar, { flexWrap: "nowrap" }]}>
-        <Btn icon="ArrowLeft" onPress={onBack} />
+        <Btn icon="ArrowLeft" title="All connections" onPress={onBack} />
         <Text numberOfLines={1} style={[ui.title, { flex: 1 }]}>
           {connection.name}
         </Text>
-        <Btn icon="Settings2" onPress={onEdit} />
+        <Btn icon="Settings2" title={`Edit ${connection.name}`} onPress={onEdit} />
       </View>
       <View style={{ padding: 8, gap: 6 }}>
-        {info.databaseLabel && databases.data ? <Select label={info.databaseLabel} value={database ?? ""} options={databases.data.databases.map((name) => ({ label: name, value: name }))} onChange={(next) => onPlace({ database: next })} /> : null}
-        {info.schemaLabel && schemas.data ? <Select label={info.schemaLabel} value={schema ?? ""} options={schemas.data.schemas.map((name) => ({ label: name, value: name }))} onChange={(next) => onPlace({ database, schema: next })} /> : null}
+        {(info.databaseLabel && databases.data) || (info.schemaLabel && schemas.data) ? (
+          <View style={{ flexDirection: stackPlace ? "column" : "row", gap: 6 }}>
+            {info.databaseLabel && databases.data ? <View style={stackPlace ? null : { flex: 1, minWidth: 0 }}><Select label={info.databaseLabel} value={database ?? ""} options={databases.data.databases.map((name) => ({ label: name, value: name }))} onChange={(next) => onPlace({ database: next })} /></View> : null}
+            {info.schemaLabel && schemas.data ? <View style={stackPlace ? null : { flex: 1, minWidth: 0 }}><Select label={info.schemaLabel} value={schema ?? ""} options={schemas.data.schemas.map((name) => ({ label: name, value: name }))} onChange={(next) => onPlace({ database, schema: next })} /></View> : null}
+          </View>
+        ) : null}
         <TextInput accessibilityLabel={`Find ${info.objectLabel}`} value={pattern} onChangeText={setPattern} placeholder={`Find ${info.objectLabel}`} placeholderTextColor={ui.colors.foregroundMuted} autoCapitalize="none" autoCorrect={false} style={ui.input} />
-        <View style={ui.wrap}>
+        <View style={[ui.row, { gap: 2 }]}>
           <Btn icon="SquareTerminal" label="Query" onPress={() => onQuery()} />
           <Btn icon="Plus" label={`New ${info.objectLabel}`} onPress={() => onQuery(info.createTemplate)} />
-          <Btn icon="RefreshCw" onPress={() => void objects.refetch()} />
+          <View style={{ flex: 1 }} />
+          <Btn icon="RefreshCw" title={`Refresh ${info.objectLabel} list`} onPress={() => void objects.refetch()} />
         </View>
         {error ? <Message kind="error" text={errorText(error)} /> : null}
         {objects.isLoading ? <Message kind="note" text="Loading…" /> : null}
-        {!objects.isLoading && !error && items.length === 0 ? <Message kind="note" text={`No ${info.objectLabel} found.`} /> : null}
+        {enabled && !databases.isLoading && !schemas.isLoading && !objects.isLoading && !error && items.length === 0 ? <Message kind="note" text={`No ${info.objectLabel} found.`} /> : null}
       </View>
       <FlatList
         style={{ flex: 1, minHeight: 0 }}

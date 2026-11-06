@@ -23,12 +23,10 @@ export function StructureTab({ connection, refObject, onDropped }: { connection:
           {data.facts.length > 0 ? (
             <View style={ui.wrap}>
               {data.facts.map((fact) => (
-                <View key={fact.label} style={[ui.card, { paddingVertical: 8, gap: 2 }]}>
-                  <Text style={ui.muted}>{fact.label}</Text>
-                  <Text selectable style={ui.body}>
-                    {fact.value}
-                  </Text>
-                </View>
+                <Text key={fact.label} selectable style={[ui.body, { paddingRight: 12 }]}>
+                  <Text style={ui.muted}>{fact.label} </Text>
+                  {fact.value}
+                </Text>
               ))}
             </View>
           ) : null}

@@ -1,4 +1,4 @@
-import { copyText, FlatList, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, FlatList, Icon, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
@@ -7,12 +7,12 @@ import { ENGINES } from "../shared/engines";
 import { toMarkdownTable } from "../shared/markdown";
 import { QUERY_LIMITS, TIME_LIMITS_MS } from "../shared/preferences";
 import { Grid } from "./grid";
-import { Btn, Chip, errorText, Field, Message, Modal, Select, useApi, useConfirm, useGuardedRun, useUi } from "./kit";
+import { Btn, Chip, errorText, Field, Message, Modal, MoreMenu, Segmented, useApi, useConfirm, useGuardedRun, useUi } from "./kit";
 import { usePreferences } from "./preferences";
 import { type EditorControl, SqlEditor } from "./sql-editor";
 import { ExportModal } from "./transfer";
 
-const TIME_LABELS: Record<number, string> = { 30000: "30 s limit", 60000: "1 min limit", 300000: "5 min limit", 1800000: "30 min limit" };
+const TIME_LABELS: Record<number, string> = { 30000: "30 s", 60000: "1 min", 300000: "5 min", 1800000: "30 min" };
 const MAX_TABS = 30;
 
 function rowCount(count: number): string {
@@ -145,12 +145,11 @@ export function QueryWorkspace({ connection, scope, prefill, onPrefillUsed }: { 
 
   return (
     <View style={{ flex: 1, minHeight: 0 }}>
-      <View style={[ui.toolbar, { paddingVertical: 4 }]}>
+      <View style={[ui.toolbar, { gap: 2 }]}>
         {state.tabs.map((tab) => (
-          <Chip key={tab.id} label={tab.name} on={tab.id === state.activeId} onPress={() => (tab.id === state.activeId ? setRenaming(tab.id) : setState({ ...state, activeId: tab.id }))} />
+          <QueryTabButton key={tab.id} name={tab.name} active={tab.id === state.activeId} canClose={state.tabs.length > 1 || tab.text !== ""} onPress={() => (tab.id === state.activeId ? setRenaming(tab.id) : setState({ ...state, activeId: tab.id }))} onClose={() => void close(tab.id)} />
         ))}
-        <Btn icon="Plus" disabled={state.tabs.length >= MAX_TABS} onPress={add} />
-        {state.tabs.length > 1 || state.tabs[0]?.text ? <Btn icon="X" label="Close tab" onPress={() => void close(state.activeId)} /> : null}
+        <Btn icon="Plus" title="New query tab" disabled={state.tabs.length >= MAX_TABS} onPress={add} />
       </View>
       {saveError ? <View style={{ paddingHorizontal: 12 }}><Message kind="warning" text={`Drafts could not be saved: ${saveError}`} /></View> : null}
       {notice ? <View style={{ paddingHorizontal: 12 }}><Message kind="warning" text={notice} /></View> : null}
@@ -164,6 +163,26 @@ export function QueryWorkspace({ connection, scope, prefill, onPrefillUsed }: { 
         patch(renaming, { name });
         setRenaming(null);
       }} /> : null}
+    </View>
+  );
+}
+
+// Pressing the open tab renames it.
+function QueryTabButton({ name, active, canClose, onPress, onClose }: { name: string; active: boolean; canClose: boolean; onPress: () => void; onClose: () => void }) {
+  const ui = useUi();
+  const c = ui.colors;
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", borderRadius: 6, backgroundColor: active ? c.surface2 : "transparent" }}>
+      <Pressable accessibilityRole="button" accessibilityLabel={active ? `Rename ${name}` : `Open ${name}`} accessibilityState={{ selected: active }} onPress={onPress} style={{ minHeight: ui.compact ? 36 : 26, justifyContent: "center", paddingLeft: 9, paddingRight: active && canClose ? 2 : 9 }}>
+        <Text numberOfLines={1} style={{ fontSize: 12, maxWidth: 160, color: active ? c.foreground : c.foregroundMuted, fontWeight: active ? "500" : "400" }}>
+          {name}
+        </Text>
+      </Pressable>
+      {active && canClose ? (
+        <Pressable accessibilityRole="button" accessibilityLabel={`Close ${name}`} onPress={onClose} style={{ minHeight: ui.compact ? 36 : 26, minWidth: ui.compact ? 32 : 22, alignItems: "center", justifyContent: "center" }}>
+          <Icon name="X" size={12} color={c.foregroundMuted} />
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -198,7 +217,7 @@ export function QueryPane({ connection, scope, text, onText, active = true, lock
   const [job, setJob] = useState<JobView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeResult, setActiveResult] = useState(0);
-  const [panel, setPanel] = useState<"history" | "saved" | "save" | null>(null);
+  const [panel, setPanel] = useState<"history" | "saved" | "save" | "options" | null>(null);
   const [exporting, setExporting] = useState<string | null>(null);
   const editor = useRef<EditorControl | null>(null);
   const running = useRef(false);
@@ -246,23 +265,32 @@ export function QueryPane({ connection, scope, text, onText, active = true, lock
     <View style={{ flex: 1, minHeight: 0 }}>
       <View style={{ padding: 8, gap: 6, borderBottomWidth: 1, borderBottomColor: ui.colors.border }}>
         <SqlEditor control={editor} connection={connection} scope={scope} text={text} onChangeText={(next) => onText(normalized(next))} onSelection={setSelected} onRun={() => void execute(toRun())} readOnly={locked} active={active} />
-        <View style={ui.wrap}>
-          {isRunning ? <Btn icon="Square" label="Stop" kind="danger" onPress={() => job && void api.cancelJob({ id: job.id })} /> : <Btn icon="Play" label={hasSelection ? "Run selection" : "Run"} kind="primary" disabled={text.trim() === ""} onPress={() => void execute(toRun())} />}
-          {info.explainPrefix ? <Btn label="Explain" disabled={isRunning || text.trim() === ""} onPress={() => void execute(toRun(), true)} /> : null}
-          <Select label="Most rows to show" value={String(limit)} options={QUERY_LIMITS.map((value) => ({ label: `${value} rows`, value: String(value) }))} onChange={(value) => setLimit(Number(value))} />
-          <Select label="Time limit" value={String(timeoutMs)} options={TIME_LIMITS_MS.map((value) => ({ label: TIME_LABELS[value] as string, value: String(value) }))} onChange={(value) => setTimeoutMs(Number(value))} />
-          {locked ? null : <Btn icon="History" label="History" onPress={() => setPanel("history")} />}
-          {locked ? null : <Btn icon="Bookmark" label="Saved" onPress={() => setPanel("saved")} />}
-          {locked ? null : <Btn icon="BookmarkPlus" disabled={text.trim() === ""} onPress={() => setPanel("save")} />}
-          <Btn icon="Download" label="Export" disabled={text.trim() === ""} onPress={() => setExporting(toRun())} />
+        <View style={[ui.wrap, { justifyContent: "space-between", gap: 2 }]}>
+          <View style={[ui.row, { gap: 2 }]}>
+            {isRunning ? <Btn icon="Square" label="Stop" kind="danger" onPress={() => job && void api.cancelJob({ id: job.id })} /> : <Btn icon="Play" label={hasSelection ? "Run selection" : "Run"} kind="primary" disabled={text.trim() === ""} onPress={() => void execute(toRun())} />}
+            {info.explainPrefix ? <Btn label="Explain" disabled={isRunning || text.trim() === ""} onPress={() => void execute(toRun(), true)} /> : null}
+          </View>
+          <View style={[ui.wrap, { gap: 2 }]}>
+            {locked ? null : <Btn icon="History" title="History" label={ui.compact ? undefined : "History"} onPress={() => setPanel("history")} />}
+            {locked ? null : <Btn icon="Bookmark" title="Saved queries" label={ui.compact ? undefined : "Saved"} onPress={() => setPanel("saved")} />}
+            <Btn icon="Gauge" title={`Limits: ${limit} rows, ${TIME_LABELS[timeoutMs] ?? ""}`} label={ui.compact ? undefined : `${limit} rows · ${TIME_LABELS[timeoutMs] ?? ""}`} onPress={() => setPanel("options")} />
+            <MoreMenu
+              items={[
+                ...(locked ? [] : [{ label: "Save this query", icon: "BookmarkPlus", disabled: text.trim() === "", onPress: () => setPanel("save") }]),
+                { label: "Export results", icon: "Download", disabled: text.trim() === "", onPress: () => setExporting(toRun()) },
+              ]}
+            />
+          </View>
         </View>
         {hasSelection ? (
           <Text numberOfLines={1} style={ui.muted}>
             Selection, {selected.length} characters: {firstLine}
           </Text>
-        ) : (
-          <Text style={ui.muted}>{info.queryLanguage}. Statements run one at a time, each in a fresh session for this run; if one fails, the rest do not run.{locked ? "" : " Drafts: if two windows edit one tab, the last save wins."}</Text>
-        )}
+        ) : text.trim() === "" && info.queryLanguage !== "SQL" ? (
+          <Text style={ui.muted}>{info.queryLanguage}</Text>
+        ) : /[;\n]\s*\S/.test(text) ? (
+          <Text style={ui.muted}>Statements run one at a time, each in a fresh session for this run; if one fails, the rest do not run.</Text>
+        ) : null}
         {error ? <Message kind="error" text={error} /> : null}
         {outcome}
       </View>
@@ -284,7 +312,8 @@ export function QueryPane({ connection, scope, text, onText, active = true, lock
             {current.columns.length > 0 && current.rows.length > 0 ? (
               <Btn
                 icon="ClipboardCopy"
-                label="Copy as Markdown"
+                title="Copy as Markdown"
+                label={ui.compact ? undefined : "Copy as Markdown"}
                 onPress={() =>
                   void copyText(toMarkdownTable(current.columns.map((column) => column.name), current.rows, undefined, current.cutCells)).then(
                     () => toast.show(`Copied ${rowCount(current.rows.length)}`, { variant: "success" }),
@@ -317,9 +346,32 @@ export function QueryPane({ connection, scope, text, onText, active = true, lock
           }}
         />
       ) : null}
+      {panel === "options" ? <LimitsModal limit={limit} timeoutMs={timeoutMs} locked={locked} onLimit={setLimit} onTimeout={setTimeoutMs} onClose={() => setPanel(null)} /> : null}
       {panel === "save" ? <SaveModal connectionId={connection.id} text={text} onClose={() => setPanel(null)} /> : null}
       {exporting !== null ? <ExportModal connection={connection} source={{ kind: "query", scope, text: exporting }} name="query" onClose={() => setExporting(null)} /> : null}
     </View>
+  );
+}
+
+function LimitsModal({ limit, timeoutMs, locked, onLimit, onTimeout, onClose }: { limit: number; timeoutMs: number; locked: boolean; onLimit: (limit: number) => void; onTimeout: (ms: number) => void; onClose: () => void }) {
+  const ui = useUi();
+  return (
+    <Modal title="Limits" open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <Modal.Content>
+        <View style={{ gap: 4 }}>
+          <Text style={ui.label}>Most rows to show</Text>
+          <Segmented label="Most rows to show" value={String(limit)} options={QUERY_LIMITS.map((value) => ({ label: String(value), value: String(value) }))} onChange={(value) => onLimit(Number(value))} />
+        </View>
+        <View style={{ gap: 4 }}>
+          <Text style={ui.label}>Time limit</Text>
+          <Segmented label="Time limit" value={String(timeoutMs)} options={TIME_LIMITS_MS.map((value) => ({ label: TIME_LABELS[value] as string, value: String(value) }))} onChange={(value) => onTimeout(Number(value))} />
+        </View>
+        <Text style={ui.muted}>Statements run one at a time, each in a fresh session for this run; if one fails, the rest do not run.{locked ? "" : " Drafts: if two windows edit one tab, the last save wins."}</Text>
+        <View style={[ui.row, { justifyContent: "flex-end" }]}>
+          <Btn label="Done" kind="primary" onPress={onClose} />
+        </View>
+      </Modal.Content>
+    </Modal>
   );
 }
 
@@ -363,7 +415,7 @@ function SavedModal({ connectionId, onClose, onPick }: { connectionId: string; o
     <Modal title="Saved queries" open onOpenChange={(open) => (open ? undefined : onClose())}>
       <Modal.Content scrollable={false} contentContainerStyle={{ padding: 0, gap: 0 }}>
         {saved.data?.queries.length === 0 ? <View style={{ padding: 12 }}><Text style={ui.muted}>Nothing saved yet.</Text></View> : null}
-        <FlatList style={{ flex: 1, minHeight: 0 }} data={saved.data?.queries ?? []} keyExtractor={(query) => query.id} renderItem={({ item }) => <PickRow title={item.name} detail={item.text.slice(0, 120)} onPress={() => onPick(item.text)} trailing={<Btn icon="Trash2" onPress={() => void api.deleteSaved({ connectionId, id: item.id }).then(() => saved.refetch())} />} />} />
+        <FlatList style={{ flex: 1, minHeight: 0 }} data={saved.data?.queries ?? []} keyExtractor={(query) => query.id} renderItem={({ item }) => <PickRow title={item.name} detail={item.text.slice(0, 120)} onPress={() => onPick(item.text)} trailing={<Btn icon="Trash2" title={`Delete ${item.name}`} onPress={() => void api.deleteSaved({ connectionId, id: item.id }).then(() => saved.refetch())} />} />} />
       </Modal.Content>
     </Modal>
   );

@@ -7,7 +7,7 @@ import { ENGINES } from "../shared/engines";
 import { AgentRequestsModal, usePendingAgentRequests } from "./agent-requests";
 import { ConnectionForm, ConnectionList, UnlockPrompt } from "./connections";
 import { DataTab, type JumpTarget } from "./data-tab";
-import { Btn, Chip, ConfirmProvider, connectionColorValue, errorText, Message, type Theme, UiProvider, useApi, useConfirm, useUi } from "./kit";
+import { Btn, ConfirmProvider, connectionColorValue, errorText, Pill, Segmented, type Theme, UiProvider, useApi, useConfirm, useUi } from "./kit";
 import { PendingProvider, usePending } from "./pending";
 import { PreferencesProvider } from "./preferences";
 import { QueryWorkspace } from "./query-tab";
@@ -181,7 +181,7 @@ function Main({ surface }: { surface: string }) {
           <Text style={ui.warning}>
             {waitingRequests} agent request{waitingRequests === 1 ? "" : "s"} waiting. Nothing is written until you approve.
           </Text>
-          <Btn label="Review" kind="primary" onPress={() => setAgentRequestsOpen(true)} />
+          <Btn label="Review" on onPress={() => setAgentRequestsOpen(true)} />
         </View>
       ) : null}
       {agentRequestsOpen ? <AgentRequestsModal onClose={() => setAgentRequestsOpen(false)} /> : null}
@@ -234,32 +234,29 @@ function Content({ connection, place, object, tab, setTab, prefill, onPrefillUse
   const ref = object ? { ...scope, name: object.name } : null;
   const activeJump = jump && jump.object === object?.name ? jump : null;
   const bar = connectionColorValue(ui.colors, connection.color);
+  // The connection's name is out of view on a phone, and a production warning must say which one it means.
+  const pills = (
+    <>
+      {connection.environment === "production" ? <Pill text={ui.compact ? `Production: ${connection.name}` : "Production"} kind="danger" detail={`Production: ${connection.name}`} /> : null}
+      {connection.safety === "read-only" ? <Pill text="Read-only" /> : null}
+      {connection.notEncrypted ? <Pill text="Not encrypted" kind="warning" detail="Not encrypted: this connection sends data and its password in the clear." /> : null}
+    </>
+  );
+  const hasPills = connection.environment === "production" || connection.safety === "read-only" || connection.notEncrypted;
+  const tabs: { label: string; value: Tab }[] = [...(ref ? [{ label: "Data", value: "data" as const }, { label: "Structure", value: "structure" as const }] : []), { label: info.queryLanguage === "SQL" ? "SQL" : "Query", value: "query" }];
   return (
     <View style={{ flex: 1, minHeight: 0, borderTopWidth: bar ? 3 : 0, borderTopColor: bar ?? "transparent" }}>
       <View style={[ui.toolbar, { justifyContent: "space-between" }]}>
-        <View style={[ui.row, { flexShrink: 1 }]}>
-          {ui.compact ? <Btn icon="ArrowLeft" onPress={onBack} /> : null}
+        <View style={[ui.row, { flexShrink: 1, minWidth: 0 }]}>
+          {ui.compact ? <Btn icon="ArrowLeft" title="Back" onPress={onBack} /> : null}
           <Text numberOfLines={1} style={[ui.title, { flexShrink: 1 }]}>
             {tab === "query" ? "Query" : object?.name}
           </Text>
-          {connection.safety === "read-only" ? <Chip label="Read-only" on={false} onPress={() => undefined} disabled /> : null}
+          {ui.compact ? null : pills}
         </View>
-        <View style={ui.wrap}>
-          {ref ? <Chip label="Data" on={tab === "data"} onPress={() => setTab("data")} /> : null}
-          {ref ? <Chip label="Structure" on={tab === "structure"} onPress={() => setTab("structure")} /> : null}
-          <Chip label={info.queryLanguage === "SQL" ? "SQL" : "Query"} on={tab === "query"} onPress={() => setTab("query")} />
-        </View>
+        {tabs.length > 1 ? <Segmented label="View" value={tab} options={tabs} onChange={setTab} /> : null}
       </View>
-      {connection.environment === "production" ? (
-        <View style={{ paddingHorizontal: 12, paddingVertical: 4, backgroundColor: ui.colors.surface1, borderBottomWidth: 1, borderBottomColor: ui.colors.statusDanger }}>
-          <Text style={[ui.danger, { fontWeight: "600" }]}>Production: {connection.name}</Text>
-        </View>
-      ) : null}
-      {connection.notEncrypted ? (
-        <View style={{ paddingHorizontal: 12 }}>
-          <Message kind="warning" text="Not encrypted: this connection sends data and its password in the clear." />
-        </View>
-      ) : null}
+      {ui.compact && hasPills ? <View style={[ui.wrap, { paddingHorizontal: 8, paddingVertical: 5 }]}>{pills}</View> : null}
       {tab === "data" && ref ? <DataTab key={`${JSON.stringify(ref)}:${activeJump?.revision ?? ""}`} connection={connection} refObject={ref} initialFilters={activeJump?.filters} onJump={onJump} /> : null}
       {tab === "structure" && ref ? <StructureTab key={JSON.stringify(ref)} connection={connection} refObject={ref} onDropped={onDropped} /> : null}
       {/* Kept mounted, so moving between tabs does not lose the text or the results. */}
