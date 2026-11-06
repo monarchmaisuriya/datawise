@@ -4,6 +4,12 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-06
+
+### Changed
+
+- No change in behavior. Adds screenshots for the plugin listing, corrects the update example in the README, and states in the overview what the plugin reads to find its own files and what installing it needs.
+
 ## [0.1.0] - 2026-11-06
 
 First release.

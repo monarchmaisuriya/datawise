@@ -19,9 +19,15 @@ Each connection has a write mode. **Ask first** is the default: every change sho
 
 Read-only is strong but not absolute. Datawise refuses anything it cannot prove is a read and, on most engines, also opens a read-only session. Even so, a function called from a `SELECT` can reach outside what either check sees, such as `dblink_exec` on PostgreSQL. In Ask first mode, such a function runs without a prompt. For a production database, the only full guarantee is a database user without write rights.
 
+## Setup
+
+Installing needs `npm` on the daemon machine's path, which fetches the database drivers from the npm registry, about 130 MB. Nothing is downloaded after that. Add a connection with your own host and credentials; there is no account to create.
+
 ## Where data and passwords go
 
-The plugin runs on the daemon machine and connects from there. Nothing is sent anywhere else. Query results are not given to agents.
+The plugin runs on the daemon machine and connects from there, to the hosts you give it. Nothing else is contacted, and query results are not given to agents.
+
+It reads Paseo's `config.json` once, only to find its own folder, because its drivers load from there. SQLite connections each run in a child process, so that a slow query can be stopped.
 
 Connections, query history and saved queries are stored in `plugin-data/datawise/connections.json` in the Paseo home folder, readable only by your user. Passwords are in that file in plain text, the same protection `.pgpass` has, so **any process running as your user can read them, including agents you run in Paseo**. A connection can keep its database password for the session only, in memory, and ask again after Paseo restarts. SSH secrets and API keys are always stored in the file. History holds the text of queries you ran, which can contain values; it can be cleared.
 
