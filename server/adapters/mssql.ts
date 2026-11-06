@@ -1,7 +1,7 @@
 import type { ConnectionPool, config as MssqlConfig, Request, Transaction } from "mssql";
 import { loadDriver } from "../drivers";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
-import { SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
+import { groupRows, SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
 import type { Adapter, AdapterContext } from "./types";
 
 function quote(identifier: string): string {
@@ -186,8 +186,8 @@ class MssqlDriver implements SqlDriver {
     const list = [...indexes.values()];
     const key = list.find((index) => index.primary) ?? list.find((index) => index.unique && index.usable);
     const keyColumns = kind === "table" ? (key?.columns ?? []) : [];
-    const fks = await this.rows(db, `SELECT f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id), OBJECT_NAME(f.referenced_object_id), COL_NAME(fc.referenced_object_id, fc.referenced_column_id)
-      FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id WHERE f.parent_object_id = @p1`, [objectId]);
+    const fks = await this.rows(db, `SELECT f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id), OBJECT_NAME(f.referenced_object_id), COL_NAME(fc.referenced_object_id, fc.referenced_column_id), OBJECT_SCHEMA_NAME(f.referenced_object_id)
+      FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id WHERE f.parent_object_id = @p1 ORDER BY f.name, fc.constraint_column_id`, [objectId]);
     const definition = kind === "view" ? String((await this.rows(db, "SELECT OBJECT_DEFINITION(@p1)", [objectId]))[0]?.[0] ?? "") : null;
     const estimate = await this.rows(db, "SELECT SUM(row_count) FROM sys.dm_db_partition_stats WHERE object_id = @p1 AND index_id IN (0,1)", [objectId]).catch(() => []);
     return {
@@ -197,7 +197,7 @@ class MssqlDriver implements SqlDriver {
       keyColumns,
       keyReason: keyColumns.length > 0 ? null : kind === "table" ? `${ref.name} has no primary key or usable unique index, so its rows cannot be changed one at a time.` : "A view cannot be edited here.",
       indexes: list.map(({ name, columns: names, unique }) => ({ name, columns: names, unique })),
-      foreignKeys: fks.map((row) => ({ name: String(row[0]), columns: [String(row[1])], references: `${String(row[2])} (${String(row[3])})` })),
+      foreignKeys: [...groupRows(fks, (row) => String(row[0])).entries()].map(([name, rows]) => ({ name, columns: rows.map((row) => String(row[1])), references: `${String(rows[0]?.[2])} (${rows.map((row) => String(row[3])).join(", ")})`, targetDatabase: null, targetSchema: String(rows[0]?.[4]), targetTable: String(rows[0]?.[2]), targetColumns: rows.map((row) => String(row[3])) })),
       definition,
       facts: estimate[0]?.[0] === undefined ? [] : [{ label: "Estimated rows", value: String(estimate[0][0]) }],
     };

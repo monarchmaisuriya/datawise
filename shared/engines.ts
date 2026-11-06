@@ -49,6 +49,12 @@ export interface EngineInfo {
   canDrop: boolean;
   // Whether import can run inside one transaction, so a failure leaves nothing behind.
   transactionalImport: boolean;
+  // Whether several row edits can commit as one, or not at all. Stricter than import: it needs key-based
+  // reads and writes inside one transaction, with values compared before writing.
+  transactionalEdits: boolean;
+  // Whether names and types come from a catalog. Where they come from the data itself, as with Redis keys
+  // or fields sampled from documents, an agent asking for "structure" would be reading the data.
+  catalogSchema: boolean;
   // Keeps whatever type a value has and accepts new fields, so CSV numbers should not stay text.
   schemaless: boolean;
   exportSqlInserts: boolean;
@@ -80,6 +86,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: true,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: true,
@@ -106,6 +114,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: true,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: true,
@@ -132,6 +142,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: true,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: false,
@@ -158,6 +170,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: true,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: true,
@@ -184,6 +198,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: true,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: true,
@@ -211,6 +227,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: true,
     supportsTls: true,
@@ -237,6 +255,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: false,
     schemaless: true,
     exportSqlInserts: false,
     supportsTls: true,
@@ -263,6 +283,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: false,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: false,
     schemaless: false,
     exportSqlInserts: false,
     supportsTls: true,
@@ -289,6 +311,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: false,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: false,
     schemaless: true,
     exportSqlInserts: false,
     supportsTls: true,
@@ -315,6 +339,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: true,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: true,
     schemaless: false,
     exportSqlInserts: false,
     supportsTls: true,
@@ -341,6 +367,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: false,
     canDrop: true,
     transactionalImport: false,
+    transactionalEdits: false,
+    catalogSchema: false,
     schemaless: true,
     exportSqlInserts: false,
     supportsTls: false,
@@ -367,6 +395,8 @@ export const ENGINES: Record<EngineId, EngineInfo> = {
     canTruncate: false,
     canDrop: true,
     transactionalImport: true,
+    transactionalEdits: false,
+    catalogSchema: false,
     schemaless: true,
     exportSqlInserts: false,
     supportsTls: true,

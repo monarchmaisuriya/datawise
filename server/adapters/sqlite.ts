@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
-import { ansiQuote, SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
+import { ansiQuote, groupRows, SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
 import type { Adapter, AdapterContext } from "./types";
 
 // node:sqlite blocks its thread, and neither a worker's terminate() nor any API can stop a running query.
@@ -18,7 +18,9 @@ if (readOnly) {
   // The file flag still lets statements such as VACUUM INTO write elsewhere. This denies all but reads.
   const c = sqlite.constants;
   const allowed = new Set([c.SQLITE_SELECT, c.SQLITE_READ, c.SQLITE_FUNCTION, c.SQLITE_RECURSIVE, c.SQLITE_TRANSACTION]);
-  db.setAuthorizer((action) => (allowed.has(action) ? c.SQLITE_OK : c.SQLITE_DENY));
+  // Browsing reads the catalog through these. A pragma not named here could change a setting.
+  const readPragmas = new Set(["table_info", "table_xinfo", "table_list", "index_list", "index_info", "index_xinfo", "foreign_key_list", "database_list"]);
+  db.setAuthorizer((action, name) => (allowed.has(action) || (action === c.SQLITE_PRAGMA && readPragmas.has(String(name).toLowerCase())) ? c.SQLITE_OK : c.SQLITE_DENY));
 }
 let iterator = null;
 let statement = null;
@@ -52,7 +54,11 @@ process.on("message", ({ id, op, args }) => {
   try { process.send({ id, value: handlers[op](args) }); }
   catch (error) { process.send({ id, error: String((error && error.message) || error) }); }
 });
-process.on("disconnect", () => process.exit(0));
+// A clean close lets SQLite tidy up, so routine closes do not leave -wal and -shm files behind.
+process.on("disconnect", () => {
+  try { db.close(); } catch {}
+  process.exit(0);
+});
 process.send({ id: 0, value: "ready" });
 `;
 
@@ -103,8 +109,20 @@ class SqliteConnection {
     });
   }
 
+  // For a cancel: the only way to stop a running query.
   async terminate(): Promise<void> {
     this.child.kill("SIGKILL");
+  }
+
+  // For a routine close: the child closes the database and exits. A child busy in a query cannot hear
+  // that, so it is stopped after a short wait.
+  async close(): Promise<void> {
+    if (!this.alive) return;
+    const timer = setTimeout(() => this.child.kill("SIGKILL"), 2000);
+    timer.unref();
+    this.child.once("exit", () => clearTimeout(timer));
+    this.failure = new Error("Closed.");
+    if (this.child.connected) this.child.disconnect();
   }
 }
 
@@ -131,10 +149,14 @@ class SqliteDriver implements SqlDriver {
   private shared: SqliteConnection | null = null;
   private sharedBusy: Promise<unknown> = Promise.resolve();
   private readonly file: string;
+  private readonly readOnly: boolean;
   private readonly sessions = new Set<SqliteConnection>();
 
   constructor(context: AdapterContext) {
     this.file = context.connection.file;
+    // Grid reads share this connection, so a read-only connection must open it read-only too, or a file
+    // in a read-only folder could not be browsed at all.
+    this.readOnly = context.connection.safety === "read-only";
     if (!this.file) throw new Error("SQLite needs a file path.");
     // Opening a missing path would quietly create an empty database and hide a typing mistake.
     if (!existsSync(this.file)) throw new Error(`No file at ${this.file}.`);
@@ -176,7 +198,7 @@ class SqliteDriver implements SqlDriver {
     });
     await previous;
     // A deadline stops a slow read by killing the child, so check after waiting for the turn.
-    if (!this.shared?.alive) this.shared = this.connection(false);
+    if (!this.shared?.alive) this.shared = this.connection(this.readOnly);
     const shared = this.shared;
     return this.session(shared, async () => release());
   }
@@ -185,7 +207,7 @@ class SqliteDriver implements SqlDriver {
     const connection = this.connection(readOnly);
     return this.session(connection, async () => {
       this.sessions.delete(connection);
-      await connection.terminate();
+      await connection.close();
     });
   }
 
@@ -234,7 +256,7 @@ class SqliteDriver implements SqlDriver {
       const allNotNull = columns.every((column) => info.some((item) => String(item[0]) === column && Number(item[2]) === 1));
       if (uniqueKey === null && Number(row[1]) === 1 && Number(row[2]) === 0 && allNotNull) uniqueKey = columns;
     }
-    const fks = await this.all("SELECT id, \"from\", \"table\", \"to\" FROM pragma_foreign_key_list(?)", [ref.name]);
+    const fks = await this.all("SELECT id, \"from\", \"table\", \"to\" FROM pragma_foreign_key_list(?) ORDER BY id, seq", [ref.name]);
     const keyColumns = kind === "table" ? (primary.length > 0 ? primary : (uniqueKey ?? [])) : [];
     return {
       name: ref.name,
@@ -246,7 +268,15 @@ class SqliteDriver implements SqlDriver {
       keyColumns,
       keyReason: keyColumns.length > 0 ? null : kind === "table" ? `${ref.name} has no primary key or usable unique index, so its rows cannot be changed one at a time.` : "A view cannot be edited here.",
       indexes,
-      foreignKeys: fks.map((row) => ({ name: `fk_${String(row[0])}`, columns: [String(row[1])], references: `${String(row[2])} (${String(row[3] ?? "")})` })),
+      foreignKeys: await Promise.all(
+        [...groupRows(fks, (row) => String(row[0])).entries()].map(async ([id, rows]) => {
+          const target = String(rows[0]?.[2]);
+          // A foreign key may leave out the target columns, meaning the target's primary key.
+          const stated = rows.map((row) => (row[3] === null ? null : String(row[3])));
+          const targetColumns = stated.every((name) => name !== null) ? (stated as string[]) : (await this.all("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", [target])).map((row) => String(row[0]));
+          return { name: `fk_${id}`, columns: rows.map((row) => String(row[1])), references: `${target} (${targetColumns.join(", ")})`, targetDatabase: null, targetSchema: null, targetTable: target, targetColumns };
+        }),
+      ),
       definition: master[1] === null ? null : String(master[1]),
       facts: [],
     };
@@ -256,7 +286,7 @@ class SqliteDriver implements SqlDriver {
     const all = [...this.sessions];
     this.sessions.clear();
     this.shared = null;
-    await Promise.allSettled(all.map((connection) => connection.terminate()));
+    await Promise.allSettled(all.map((connection) => connection.close()));
   }
 }
 

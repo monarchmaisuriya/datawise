@@ -1,14 +1,18 @@
 // Runs the plugin's real RPC handlers against real servers from test/compose.yaml. Build and run it with
 // scripts/conformance.sh, which uses Electron's Node, the runtime the plugin gets inside Paseo.
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ZodType } from "zod";
-import { type ConnectionInput, type JobView, type Filter, type ObjectRef, type RowPage, rpc, type StartResult } from "../shared/contracts";
+import { z, type ZodType } from "zod";
+import { type ConnectionInput, type JobView, type Filter, type ObjectRef, type RowPage, rpc, searchStructure, type StartResult } from "../shared/contracts";
+import { jumpFilters } from "../shared/foreign-keys";
+import { preferencesSchema } from "../shared/preferences";
 import { ENGINES, type EngineId } from "../shared/engines";
 import { ADAPTERS } from "../server/adapters";
 import { setDriverRoot } from "../server/drivers";
 import { contributeServer } from "../server/plugin";
+import { PreferencesReader } from "../server/preferences";
+import { SideFile } from "../server/side-file";
 import { openTunnel } from "../server/tunnel";
 
 setDriverRoot(process.cwd());
@@ -417,11 +421,26 @@ EXTRAS.mariadb = EXTRAS.mysql as (tools: Tools) => Promise<void>;
 // --- Harness ---
 
 const handlers = new Map<string, (input: unknown) => Promise<unknown>>();
+// Stands in for the daemon's settings store and hook registry, so the suite can drive both.
+let preferenceValues: Record<string, unknown> = {};
+const preferenceListeners = new Set<(next: { status: string; values: unknown }) => void>();
+const hookHandlers = new Set<(input: { request: { tools: unknown[] } }) => Promise<{ tools: { name: string; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> }[] }>>();
 const folder = mkdtempSync(join(tmpdir(), "datawise-conformance-"));
 const cleanup = contributeServer(
   {
     handle(contract: { name: string }, handler: unknown) {
       handlers.set(contract.name, handler as (input: unknown) => Promise<unknown>);
+    },
+    registerSettings: (definition: { schema: ZodType }) => ({
+      read: async () => ({ status: "ready", values: definition.schema.parse(preferenceValues) }),
+      subscribe(listener: (next: { status: string; values: unknown }) => void) {
+        preferenceListeners.add(listener);
+        return () => preferenceListeners.delete(listener);
+      },
+    }),
+    addHook(_name: string, handler: never) {
+      hookHandlers.add(handler);
+      return () => hookHandlers.delete(handler);
     },
   } as never,
   folder,
@@ -785,6 +804,543 @@ async function runSpec(key: string, spec: Spec) {
   summary.push(`${spec.label}: ${failed === 0 ? "PASS" : `${failed} FAILED`}`);
 }
 
+// Encryption modes against servers that refuse plain connections. Certificates come from
+// scripts/make-test-certs.sh: valid for "localhost" only, signed by a CA in test/certs.
+async function runTls() {
+  const certs = join(process.cwd(), "test", "certs");
+  const ca = readFileSync(join(certs, "ca.crt"), "utf8");
+  const servers: { label: string; innerHost: string; innerPort: number; input: Partial<ConnectionInput> }[] = [
+    { label: "PostgreSQL", innerHost: "postgres-tls", innerPort: 5432, input: { engine: "postgres", port: 25433, user: "dw", password: PASSWORD, database: "dw" } },
+    { label: "MySQL", innerHost: "mysql-tls", innerPort: 3306, input: { engine: "mysql", port: 23308, user: "root", password: PASSWORD, database: "dw" } },
+    { label: "Redis", innerHost: "redis-tls", innerPort: 6379, input: { engine: "redis", port: 26380, password: PASSWORD, database: "0" } },
+    { label: "MongoDB", innerHost: "mongodb-tls", innerPort: 27017, input: { engine: "mongodb", port: 27019 } },
+  ];
+  for (const server of servers) {
+    const test = (host: string, tls: "off" | "require" | "verify", caCertificate = "") => call(rpc.testConnection, { name: "tls", ...server.input, host, tls, caCertificate } as ConnectionInput);
+    const lines: string[] = [];
+    const expectOk = (name: string, result: { ok: boolean; error: string | null }) => {
+      lines.push(`  ${result.ok ? "ok  " : "FAIL"}  ${name}${result.ok ? "" : `: ${String(result.error).slice(0, 200)}`}`);
+      if (!result.ok) failures += 1;
+    };
+    const expectRefused = (name: string, result: { ok: boolean; error: string | null }) => {
+      lines.push(`  ${result.ok ? "FAIL" : "ok  "}  ${name}${result.ok ? ": connected" : ""}`);
+      if (result.ok) failures += 1;
+    };
+    expectOk("verify, right host and CA", await test("localhost", "verify", ca));
+    expectRefused("verify, wrong host name", await test("127.0.0.1", "verify", ca));
+    expectRefused("verify, CA not trusted", await test("localhost", "verify"));
+    expectOk("require, CA not trusted", await test("localhost", "require"));
+    expectRefused("off, on a TLS-only server", await test("localhost", "off"));
+    const tunnelled = (host: string) => call(rpc.testConnection, { name: "tls", ...server.input, port: server.innerPort, host, tls: "verify", caCertificate: ca, ssh: { host: "127.0.0.1", port: 22222, user: "dw" }, sshPassword: PASSWORD } as ConnectionInput);
+    expectOk("verify through an SSH tunnel, right name", await tunnelled(server.innerHost));
+    expectRefused("verify through an SSH tunnel, wrong name", await tunnelled(`datawise-test-${server.innerHost}-1`));
+    console.log(`\n${server.label} TLS\n${lines.join("\n")}`);
+    summary.push(`${server.label} TLS: ${lines.some((line) => line.startsWith("  FAIL")) ? "FAILED" : "PASS"}`);
+  }
+}
+
+// SSH keys against the test server, which holds the public halves of id_plain and id_pass.
+async function runSshKeys() {
+  const certs = join(process.cwd(), "test", "certs");
+  const key = (name: string) => readFileSync(join(certs, name), "utf8");
+  const base: ConnectionInput = { name: "ssh", engine: "postgres", host: "postgres", port: 5432, user: "dw", password: PASSWORD, database: "dw", ssh: { host: "127.0.0.1", port: 22222, user: "dw" } };
+  const lines: string[] = [];
+  const test = (changes: Partial<ConnectionInput>) => call(rpc.testConnection, { ...base, ...changes });
+  const report = (name: string, want: boolean, result: { ok: boolean; error: string | null }) => {
+    const good = result.ok === want;
+    lines.push(`  ${good ? "ok  " : "FAIL"}  ${name}${good ? "" : `: ${String(result.error).slice(0, 200)}`}`);
+    if (!good) failures += 1;
+  };
+  report("key without a passphrase", true, await test({ sshPrivateKey: key("id_plain") }));
+  report("key with its passphrase", true, await test({ sshPrivateKey: key("id_pass"), sshPassphrase: "dw-key-pass" }));
+  report("key with a wrong passphrase", false, await test({ sshPrivateKey: key("id_pass"), sshPassphrase: "nope" }));
+  report("a key the server does not know", false, await test({ sshPrivateKey: key("id_wrong") }));
+  console.log(`\nSSH keys\n${lines.join("\n")}`);
+  summary.push(`SSH keys: ${lines.some((line) => line.startsWith("  FAIL")) ? "FAILED" : "PASS"}`);
+}
+
+// A read-only connection must be able to browse a file it has no right to change.
+async function runReadOnlyFolder() {
+  const dir = mkdtempSync(join(tmpdir(), "datawise-ro-"));
+  const file = join(dir, "ro.db");
+  writeFileSync(file, "");
+  const open = await call(rpc.saveConnection, { name: "seed", engine: "sqlite", file, safety: "open" });
+  for (const text of ["create table t (id integer primary key, name text)", "insert into t values (1, 'a')"]) {
+    const started = await call(rpc.runQuery, { scope: { connectionId: open.id }, text });
+    if (started.status === "started") await waitJob(started.job);
+  }
+  await call(rpc.deleteConnection, { id: open.id });
+  chmodSync(file, 0o444);
+  chmodSync(dir, 0o555);
+  const lines: string[] = [];
+  try {
+    const saved = await call(rpc.saveConnection, { name: "ro", engine: "sqlite", file, safety: "read-only" });
+    const page = await call(rpc.readRows, { ref: { connectionId: saved.id, name: "t" }, query: { limit: 10 } });
+    const objects = await call(rpc.listObjects, { connectionId: saved.id, pattern: "", cursor: null });
+    const details = await call(rpc.describeObject, { connectionId: saved.id, name: "t" });
+    const ok = page.rows.length === 1 && objects.objects.length === 1 && details.columns.length === 2;
+    lines.push(`  ${ok ? "ok  " : "FAIL"}  browse a file in a read-only folder`);
+    if (!ok) failures += 1;
+    await call(rpc.deleteConnection, { id: saved.id });
+  } catch (error) {
+    failures += 1;
+    lines.push(`  FAIL  browse a file in a read-only folder: ${String((error as Error).message).slice(0, 300)}`);
+  } finally {
+    chmodSync(dir, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log(`\nSQLite read-only folder\n${lines.join("\n")}`);
+  summary.push(`SQLite read-only folder: ${lines.some((line) => line.startsWith("  FAIL")) ? "FAILED" : "PASS"}`);
+}
+
+// --- Features added after the first release ---
+
+class Lines {
+  lines: string[] = [];
+  constructor(private readonly label: string) {}
+  async check(name: string, work: () => Promise<void> | void) {
+    try {
+      await work();
+      this.lines.push(`  ok    ${name}`);
+    } catch (error) {
+      failures += 1;
+      this.lines.push(`  FAIL  ${name}: ${String((error as Error).message).slice(0, 300)}`);
+      if (process.env.DATAWISE_VERBOSE) console.error((error as Error).stack);
+    }
+  }
+  done() {
+    console.log(`\n${this.label}\n${this.lines.join("\n")}`);
+    summary.push(`${this.label}: ${this.lines.some((line) => line.startsWith("  FAIL")) ? "FAILED" : "PASS"}`);
+  }
+}
+
+function expectThat(condition: boolean, detail: string) {
+  if (!condition) throw new Error(detail);
+}
+
+async function refusal(work: Promise<unknown>): Promise<string> {
+  return work.then(
+    () => {
+      throw new Error("was not refused");
+    },
+    (error: Error) => {
+      if (error.message === "was not refused") throw error;
+      return error.message;
+    },
+  );
+}
+
+interface EngineFeatures {
+  label: string;
+  engine: EngineId;
+  input: Partial<ConnectionInput>;
+  scope: { database?: string; schema?: string };
+  setup: string[];
+  parent: string;
+  child: string;
+  id: string;
+  note: string;
+  big: string;
+  when: string;
+  pa: string;
+  pb: string;
+  a: string;
+  b: string;
+}
+
+function featureSetup(drop: (table: string) => string, types: { int: string; big: string; text: string; time: string; timeValue: string }, upper = false): { setup: string[]; names: Pick<EngineFeatures, "parent" | "child" | "id" | "note" | "big" | "when" | "pa" | "pb" | "a" | "b"> } {
+  const n = (name: string) => (upper ? name.toUpperCase() : name);
+  return {
+    names: { parent: n("dw_parent"), child: n("dw_child"), id: n("id"), note: n("note"), big: n("big"), when: n("happened"), pa: n("pa"), pb: n("pb"), a: n("a"), b: n("b") },
+    setup: [
+      drop("dw_child"),
+      drop("dw_parent"),
+      `create table dw_parent (a ${types.int} not null, b ${types.text} not null, label ${types.text}, primary key (a, b))`,
+      `create table dw_child (id ${types.int} primary key, pa ${types.int}, pb ${types.text}, note ${types.text} default 'PLANTED_DEFAULT', big ${types.big}, happened ${types.time}, foreign key (pa, pb) references dw_parent (a, b))`,
+      `insert into dw_parent (a, b, label) values (1, 'x', 'PLANTED_PARENT')`,
+      `insert into dw_child (id, pa, pb, note, big, happened) values (1, 1, 'x', 'PLANTED_ROW', 9007199254740993, ${types.timeValue})`,
+      `insert into dw_child (id, pa, pb, note, big, happened) values (2, 1, 'x', 'two', 2, ${types.timeValue})`,
+      `insert into dw_child (id, pa, pb, note, big, happened) values (3, null, null, 'three', 3, ${types.timeValue})`,
+    ],
+  };
+}
+
+function featureEngines(): Record<string, EngineFeatures> {
+  const ifExists = (table: string) => `drop table if exists ${table}`;
+  const mysqlTypes = { int: "int", big: "bigint", text: "varchar(50)", time: "datetime(6)", timeValue: "'2026-01-02 11:00:00.123456'" };
+  const sqlite = featureSetup(ifExists, { int: "integer", big: "integer", text: "text", time: "text", timeValue: "'2026-01-02 11:00:00'" });
+  const postgres = featureSetup(ifExists, { int: "integer", big: "bigint", text: "text", time: "timestamp", timeValue: "'2026-01-02 11:00:00.123456'" });
+  const mysql = featureSetup(ifExists, mysqlTypes);
+  const mssql = featureSetup((table) => `if object_id('dbo.${table}') is not null drop table dbo.${table}`, { int: "int", big: "bigint", text: "nvarchar(50)", time: "datetime2(6)", timeValue: "'2026-01-02 11:00:00.123456'" });
+  const oracle = featureSetup((table) => `begin execute immediate 'drop table ${table.toUpperCase()}'; exception when others then null; end;\n/`, { int: "number(10)", big: "number(38)", text: "varchar2(50)", time: "timestamp(6)", timeValue: "timestamp '2026-01-02 11:00:00.123456'" }, true);
+  const sqliteFile = join(folder, "features.db");
+  writeFileSync(sqliteFile, "");
+  return {
+    sqlite: { label: "SQLite", engine: "sqlite", input: { file: sqliteFile }, scope: {}, setup: sqlite.setup, ...sqlite.names },
+    postgres: { label: "PostgreSQL", engine: "postgres", input: specs.postgres?.input ?? {}, scope: { database: "dw", schema: "public" }, setup: postgres.setup, ...postgres.names },
+    mysql: { label: "MySQL", engine: "mysql", input: specs.mysql?.input ?? {}, scope: { database: "dw" }, setup: mysql.setup, ...mysql.names },
+    mariadb: { label: "MariaDB", engine: "mysql", input: specs.mariadb?.input ?? {}, scope: { database: "dw" }, setup: mysql.setup, ...mysql.names },
+    mssql: { label: "SQL Server", engine: "mssql", input: specs.mssql?.input ?? {}, scope: { database: "master", schema: "dbo" }, setup: mssql.setup, ...mssql.names },
+    oracle: { label: "Oracle", engine: "oracle", input: specs.oracle?.input ?? {}, scope: { schema: "DW" }, setup: oracle.setup, ...oracle.names },
+  };
+}
+
+function theHook() {
+  const [hook] = hookHandlers;
+  return hook;
+}
+
+async function describeTool() {
+  const hook = theHook();
+  if (!hook) throw new Error("no hook registered");
+  const answer = await hook({ request: { tools: [] } });
+  const tool = answer.tools.find((item) => item.name === "datawise_describe");
+  if (!tool) throw new Error("no tool in the hook's answer");
+  return tool;
+}
+
+async function runEngineFeatures(key: string, spec: EngineFeatures) {
+  const lines = new Lines(`${spec.label} features`);
+  const saved = await call(rpc.saveConnection, { name: `features-${key}`, engine: spec.engine, safety: "open", ...spec.input });
+  const scope = { connectionId: saved.id, ...spec.scope };
+  const child = { ...scope, name: spec.child };
+  const parent = { ...scope, name: spec.parent };
+  const sql = async (text: string) => {
+    const started = await call(rpc.runQuery, { scope, text, confirmed: true });
+    const job = await finish(started);
+    return job.results ?? [];
+  };
+  for (const text of spec.setup) await sql(text);
+  const page = async () => call(rpc.readRows, { ref: child, query: { limit: 10, sort: { column: spec.id, descending: false } } });
+  const at = (data: RowPage, name: string) => data.columns.findIndex((column) => column.name === name);
+  const keyOf = (data: RowPage, index: number) => ({ [spec.id]: data.rows[index]?.[at(data, spec.id)] });
+  const cell = (data: RowPage, index: number, name: string) => data.rows[index]?.[at(data, name)] ?? null;
+  const whole = (data: RowPage, index: number) => Object.fromEntries(data.columns.map((column, position) => [column.name, data.rows[index]?.[position] ?? null]));
+  const batch = (edits: unknown[], extra: Record<string, unknown> = {}) => call(rpc.writeBatch, { ref: child, edits, confirmed: true, ...extra });
+  const resultOf = async (result: StartResult) => {
+    if (result.status !== "started") throw new Error(`asked to confirm: ${result.preview}`);
+    return waitJob(result.job);
+  };
+
+  await lines.check("foreign key names every column and the target", async () => {
+    const details = await call(rpc.describeObject, child);
+    const fk = details.foreignKeys[0];
+    expectThat(fk !== undefined, "no foreign key");
+    expectThat(JSON.stringify(fk?.columns) === JSON.stringify([spec.pa, spec.pb]), `columns ${JSON.stringify(fk?.columns)}`);
+    expectThat(fk?.targetTable === spec.parent, `table ${fk?.targetTable}`);
+    expectThat(JSON.stringify(fk?.targetColumns) === JSON.stringify([spec.a, spec.b]), `target columns ${JSON.stringify(fk?.targetColumns)}`);
+  });
+  await lines.check("following it finds the row, and a null offers nothing", async () => {
+    const details = await call(rpc.describeObject, child);
+    const fk = details.foreignKeys[0];
+    if (!fk) throw new Error("no foreign key");
+    const data = await page();
+    const filters = jumpFilters(fk, (name) => cell(data, 0, name));
+    expectThat(filters !== null, "no filters for a whole key");
+    const target = await call(rpc.readRows, { ref: { ...scope, schema: fk.targetSchema ?? spec.scope.schema, database: fk.targetDatabase ?? spec.scope.database, name: fk.targetTable }, query: { limit: 10, filters } });
+    expectThat(target.rows.length === 1, `${target.rows.length} rows`);
+    expectThat(jumpFilters(fk, (name) => cell(data, 2, name)) === null, "offered a jump from a null key");
+  });
+  await lines.check("a dry run previews and writes nothing", async () => {
+    const data = await page();
+    const result = await batch([{ kind: "update", key: keyOf(data, 1), original: { [spec.note]: "two" }, changes: { [spec.note]: "dry" } }], { dryRun: true, confirmed: false });
+    expectThat(result.status === "confirm" && /UPDATE/i.test(result.preview), JSON.stringify(result).slice(0, 200));
+    expectThat(cell(await page(), 1, spec.note) === "two", "wrote during a dry run");
+  });
+  await lines.check("values just read compare equal, across types, and all edits commit", async () => {
+    const data = await page();
+    const job = await resultOf(
+      await batch([
+        { kind: "update", key: keyOf(data, 0), original: { [spec.big]: cell(data, 0, spec.big), [spec.when]: cell(data, 0, spec.when), [spec.note]: cell(data, 0, spec.note) }, changes: { [spec.big]: cell(data, 0, spec.big), [spec.when]: cell(data, 0, spec.when), [spec.note]: "batched" } },
+        { kind: "delete", key: keyOf(data, 2), original: whole(data, 2) },
+      ]),
+    );
+    expectThat(job.status === "done", `${String(job.error)} (value read: ${String(cell(data, 0, spec.when))})`);
+    const after = await page();
+    expectThat(after.rows.length === 2 && cell(after, 0, spec.note) === "batched", JSON.stringify(after.rows).slice(0, 300));
+    expectThat(String(cell(after, 0, spec.big)) === "9007199254740993", `big ${String(cell(after, 0, spec.big))}`);
+    expectThat(key === "sqlite" || String(cell(after, 0, spec.when)).startsWith("2026-01-02") && String(cell(after, 0, spec.when)).includes("123456"), `date ${String(cell(after, 0, spec.when))}`);
+  });
+  await lines.check("a row changed after staging rolls back everything and names the row", async () => {
+    const data = await page();
+    const seen = cell(data, 1, spec.note);
+    await sql(`update ${spec.child} set ${spec.note} = 'someone else' where ${spec.id} = 2`);
+    const job = await resultOf(
+      await batch([
+        { kind: "update", key: keyOf(data, 0), original: { [spec.note]: "batched" }, changes: { [spec.note]: "must not stay" } },
+        { kind: "update", key: keyOf(data, 1), original: { [spec.note]: seen }, changes: { [spec.note]: "stale" } },
+      ]),
+    );
+    expectThat(job.status === "failed" && /changed after you edited/.test(String(job.error)), `${job.status}: ${job.error}`);
+    const after = await page();
+    expectThat(cell(after, 0, spec.note) === "batched", "the first edit stayed");
+    expectThat(cell(after, 1, spec.note) === "someone else", "the second edit stayed");
+  });
+  await lines.check("a row changed after being marked for delete rolls back", async () => {
+    const data = await page();
+    const seen = whole(data, 1);
+    await sql(`update ${spec.child} set ${spec.big} = 77 where ${spec.id} = 2`);
+    const job = await resultOf(await batch([{ kind: "delete", key: keyOf(data, 1), original: seen }]));
+    expectThat(job.status === "failed" && /changed after you edited/.test(String(job.error)), `${job.status}: ${job.error}`);
+    expectThat((await page()).rows.length === 2, "the row was deleted");
+  });
+  await lines.check("a row that is gone rolls back", async () => {
+    const data = await page();
+    const job = await resultOf(await batch([{ kind: "update", key: keyOf(data, 0), original: { [spec.note]: "batched" }, changes: { [spec.note]: "must not stay" } }, { kind: "delete", key: { [spec.id]: 999 }, original: {} }]));
+    expectThat(job.status === "failed" && /no longer exists/.test(String(job.error)), `${job.status}: ${job.error}`);
+    expectThat(cell(await page(), 0, spec.note) === "batched", "the first edit stayed");
+  });
+  await lines.check("two operations on one row are refused", async () => {
+    const data = await page();
+    const message = await refusal(batch([{ kind: "update", key: keyOf(data, 0), original: {}, changes: { [spec.note]: "a" } }, { kind: "delete", key: keyOf(data, 0), original: {} }]));
+    expectThat(/same row/.test(message), message);
+  });
+  await lines.check("changing a key column is refused", async () => {
+    const data = await page();
+    const message = await refusal(batch([{ kind: "update", key: keyOf(data, 0), original: { [spec.id]: cell(data, 0, spec.id) }, changes: { [spec.id]: 50 } }]));
+    expectThat(/key column/.test(message), message);
+  });
+  await lines.check("a read-only connection refuses it", async () => {
+    const readOnly = await call(rpc.saveConnection, { name: `features-${key}-ro`, engine: spec.engine, safety: "read-only", ...spec.input });
+    const data = await page();
+    const message = await refusal(call(rpc.writeBatch, { ref: { ...child, connectionId: readOnly.id }, edits: [{ kind: "update", key: keyOf(data, 0), original: { [spec.note]: "batched" }, changes: { [spec.note]: "no" } }], confirmed: true }));
+    expectThat(/read-only/i.test(message), message);
+    expectThat(cell(await page(), 0, spec.note) === "batched", "wrote on a read-only connection");
+    await call(rpc.deleteConnection, { id: readOnly.id });
+  });
+  await lines.check("the agent tool shows names and no planted text", async () => {
+    await call(rpc.saveConnection, { id: saved.id, name: saved.name, engine: spec.engine, safety: "open", agentAccess: "schema", ...spec.input });
+    const tool = await describeTool();
+    const names = await tool.execute({}, {});
+    expectThat(String(names.text).includes(saved.name), String(names.text));
+    const tables = await tool.execute({ connection: saved.name, ...spec.scope }, {});
+    expectThat(String(tables.text).includes(spec.child), String(tables.text));
+    const columns = await tool.execute({ connection: saved.name, table: spec.child, ...spec.scope }, {});
+    expectThat(String(columns.text).includes(spec.note) && String(columns.text).includes(spec.parent), String(columns.text));
+    const everything = `${names.text}${tables.text}${columns.text}`;
+    expectThat(!everything.includes("PLANTED"), everything);
+  });
+  await lines.check("turning access off takes effect on the next call", async () => {
+    const tool = await describeTool();
+    await call(rpc.saveConnection, { id: saved.id, name: saved.name, engine: spec.engine, safety: "open", agentAccess: "none", ...spec.input });
+    const answer = await tool.execute({ connection: saved.name, table: spec.child, ...spec.scope }, {});
+    expectThat(answer.isError === true && !String(answer.text).includes(spec.note), String(answer.text));
+    expectThat(theHook() === undefined, "hook still registered");
+  });
+  await lines.check("an attachment holds structure only, from an open connection", async () => {
+    await call(rpc.readRows, { ref: child, query: { limit: 1 } });
+    const found = await call(searchStructure, { query: "dw_child" });
+    const item = found.items.find((entry) => entry.title.endsWith(spec.child));
+    expectThat(item !== undefined, JSON.stringify(found).slice(0, 200));
+    expectThat(String(item?.text).includes(spec.note) && !String(item?.text).includes("PLANTED"), String(item?.text));
+  });
+  await lines.check("an attachment search leaves out a production connection, even an open one", async () => {
+    const production = await call(rpc.saveConnection, { name: `features-${key}-prod`, engine: spec.engine, safety: "confirm", environment: "production", ...spec.input });
+    await call(rpc.readRows, { ref: { ...child, connectionId: production.id }, query: { limit: 1 } });
+    const found = await call(searchStructure, { query: "dw_child" });
+    expectThat(found.items.every((entry) => !entry.id.startsWith(production.id)), JSON.stringify(found).slice(0, 200));
+    await call(rpc.deleteConnection, { id: production.id });
+  });
+  await lines.check("an attachment search never opens a connection", async () => {
+    await call(rpc.disconnect, { id: saved.id });
+    const found = await call(searchStructure, { query: "dw_child" });
+    expectThat(found.items.every((entry) => !entry.id.startsWith(saved.id)), JSON.stringify(found).slice(0, 200));
+  });
+  if (key === "mysql" || key === "mariadb") {
+    await lines.check("a table that cannot roll back is refused", async () => {
+      await sql("drop table if exists dw_myisam");
+      await sql("create table dw_myisam (id int primary key, note varchar(10)) engine = MyISAM");
+      await sql("insert into dw_myisam values (1, 'a')");
+      const message = await refusal(call(rpc.writeBatch, { ref: { ...scope, name: "dw_myisam" }, edits: [{ kind: "update", key: { id: 1 }, original: { note: "a" }, changes: { note: "b" } }], confirmed: true }));
+      expectThat(/storage engine/.test(message), message);
+      await sql("drop table dw_myisam");
+    });
+    await lines.check("an enum's values stay out of the agent tool", async () => {
+      await sql("drop table if exists dw_enum");
+      await sql("create table dw_enum (id int primary key, state enum('PLANTED_ENUM','b'))");
+      await call(rpc.saveConnection, { id: saved.id, name: saved.name, engine: spec.engine, safety: "open", agentAccess: "schema", ...spec.input });
+      const tool = await describeTool();
+      const answer = await tool.execute({ connection: saved.name, table: "dw_enum", ...spec.scope }, {});
+      expectThat(String(answer.text).includes("state: enum") && !String(answer.text).includes("PLANTED"), String(answer.text));
+      await call(rpc.saveConnection, { id: saved.id, name: saved.name, engine: spec.engine, safety: "open", agentAccess: "none", ...spec.input });
+      await sql("drop table dw_enum");
+    });
+  }
+  if (key === "mssql") {
+    await lines.check("IF ... BEGIN ... END is one statement on the server", async () => {
+      const results = await sql(`if 1 = 1 begin delete from dbo.${spec.child} where 1 = 0; end`);
+      expectThat(results.length === 1, `${results.length} results`);
+    });
+  }
+  await sql(spec.setup[0] as string);
+  await sql(spec.setup[1] as string);
+  await call(rpc.deleteConnection, { id: saved.id });
+  lines.done();
+}
+
+// Engines whose structure comes from a catalog but which have no foreign keys or transactions.
+async function runAgentCatalog(key: "clickhouse" | "cassandra") {
+  const lines = new Lines(`${key === "clickhouse" ? "ClickHouse" : "Cassandra"} agent tool`);
+  const spec = specs[key] as Spec;
+  const saved = await call(rpc.saveConnection, { name: `agent-${key}`, engine: spec.engine, safety: "open", agentAccess: "schema", ...spec.input });
+  const scope = { connectionId: saved.id, ...spec.scope };
+  const run = async (text: string) => finish(await call(rpc.runQuery, { scope, text, confirmed: true }));
+  const statements =
+    key === "clickhouse"
+      ? ["drop table if exists dw_agent", "create table dw_agent (id UInt64, state Enum8('PLANTED_ENUM' = 1, 'b' = 2), note String default 'PLANTED_DEFAULT') engine = MergeTree order by id", "insert into dw_agent (id, state, note) values (1, 'PLANTED_ENUM', 'PLANTED_ROW')"]
+      : ["create keyspace if not exists dw with replication = {'class':'SimpleStrategy','replication_factor':1}", "drop table if exists dw.dw_agent", "create table dw.dw_agent (id int primary key, state text, note text)", "insert into dw.dw_agent (id, state, note) values (1, 'PLANTED_ENUM', 'PLANTED_ROW')"];
+  for (const text of statements) await run(text);
+  await lines.check("names and types, and no planted text", async () => {
+    const tool = await describeTool();
+    const answer = await tool.execute({ connection: saved.name, table: "dw_agent", ...spec.scope }, {});
+    expectThat(String(answer.text).includes("note") && !String(answer.text).includes("PLANTED"), String(answer.text));
+  });
+  await run(key === "clickhouse" ? "drop table dw_agent" : "drop table dw.dw_agent");
+  await call(rpc.deleteConnection, { id: saved.id });
+  lines.done();
+}
+
+async function runSettingsAndViews() {
+  const lines = new Lines("Settings, labels, views and saved state");
+  const file = join(folder, "settings.db");
+  writeFileSync(file, "");
+  const base = { engine: "sqlite", file };
+  const applyPreferences = async (values: Record<string, unknown>) => {
+    preferenceValues = values;
+    const parsed = preferencesSchema.parse(values);
+    for (const listener of preferenceListeners) listener({ status: "ready", values: parsed });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  };
+  await lines.check("a damaged settings document means defaults", async () => {
+    const reader = new PreferencesReader({ read: async () => ({ status: "invalid" }), subscribe: () => () => undefined } as never, () => undefined);
+    expectThat((await reader.get()).rowsPerPage === 100, "not the default");
+    const failing = new PreferencesReader({ read: () => Promise.reject(new Error("broken")), subscribe: () => () => undefined } as never, () => undefined);
+    expectThat((await failing.get()).queryRowLimit === 1000, "not the default");
+  });
+  await lines.check("a stored connection with no write mode stays Ask first, whatever the preference", async () => {
+    await applyPreferences({ newConnectionSafety: "open" });
+    const saved = await call(rpc.saveConnection, { name: "no-mode", ...base });
+    expectThat(saved.safety === "confirm", saved.safety);
+    await call(rpc.deleteConnection, { id: saved.id });
+    await applyPreferences({});
+  });
+  await lines.check("production cannot run without prompts, in either order", async () => {
+    await refusal(call(rpc.saveConnection, { name: "p1", ...base, environment: "production", safety: "open" }));
+    const first = await call(rpc.saveConnection, { name: "p2", ...base, safety: "open" });
+    await refusal(call(rpc.saveConnection, { id: first.id, name: "p2", ...base, safety: "open", environment: "production" }));
+    const second = await call(rpc.saveConnection, { name: "p3", ...base, environment: "production", safety: "confirm" });
+    await refusal(call(rpc.saveConnection, { id: second.id, name: "p3", ...base, environment: "production", safety: "open" }));
+    await call(rpc.deleteConnection, { id: first.id });
+    await call(rpc.deleteConnection, { id: second.id });
+  });
+  await lines.check("agent access is refused on production and on engines without a catalog", async () => {
+    await refusal(call(rpc.saveConnection, { name: "a1", ...base, environment: "production", safety: "confirm", agentAccess: "schema" }));
+    for (const engine of ["redis", "mongodb", "dynamodb", "neo4j", "elasticsearch"]) await refusal(call(rpc.saveConnection, { name: "a2", engine, host: "localhost", agentAccess: "schema" }));
+  });
+  await lines.check("no hook unless a connection is shared", async () => {
+    expectThat(theHook() === undefined, "hook registered with nothing shared");
+    const saved = await call(rpc.saveConnection, { name: "shared", ...base, agentAccess: "schema" });
+    expectThat(theHook() !== undefined, "no hook once shared");
+    await call(rpc.deleteConnection, { id: saved.id });
+    expectThat(theHook() === undefined, "hook kept after the last shared connection went");
+  });
+  await lines.check("labels survive a save and a read", async () => {
+    const saved = await call(rpc.saveConnection, { name: "labels", ...base, environment: "staging", color: "amber", group: "Team" });
+    const { connections } = await call(rpc.listConnections, {});
+    const found = connections.find((item) => item.id === saved.id);
+    expectThat(found?.environment === "staging" && found.color === "amber" && found.group === "Team", JSON.stringify(found));
+    await call(rpc.deleteConnection, { id: saved.id });
+  });
+  await lines.check("views and tabs save, stay private, and go with their connection", async () => {
+    const saved = await call(rpc.saveConnection, { name: "views", ...base });
+    const ref = { connectionId: saved.id, name: "t" };
+    const view = { hiddenColumns: ["id"], columnOrder: ["b", "a"], sort: { column: "a", descending: true }, filtersInUse: [], filters: [{ name: "mine", filters: [{ column: "a", op: "eq", value: "secret" }] }] };
+    await call(rpc.saveView, { ref, view });
+    expectThat(JSON.stringify(await call(rpc.getView, ref)) === JSON.stringify(view), "view changed on the way back");
+    expectThat((statSync(join(folder, "views.json")).mode & 0o777) === 0o600, "views.json is not private");
+    await call(rpc.saveQueryTabs, { connectionId: saved.id, tabs: { activeId: "a", tabs: [{ id: "a", name: "One", text: "select 1" }] } });
+    await call(rpc.savePlace, { surface: "screen", place: { connectionId: saved.id, object: { name: "t", kind: "table" }, tab: "structure" } });
+    expectThat((await call(rpc.getPlace, { surface: "screen" })).place?.tab === "structure", "place not kept");
+    expectThat((statSync(join(folder, "workspace.json")).mode & 0o777) === 0o600, "workspace.json is not private");
+    await call(rpc.deleteConnection, { id: saved.id });
+    expectThat((await call(rpc.getView, ref)).hiddenColumns.length === 0, "view kept after delete");
+    expectThat((await call(rpc.getQueryTabs, { connectionId: saved.id })).tabs === null, "tabs kept after delete");
+    expectThat((await call(rpc.getPlace, { surface: "screen" })).place === null, "place kept after delete");
+    await call(rpc.saveView, { ref, view });
+    await call(rpc.saveQueryTabs, { connectionId: saved.id, tabs: { activeId: "a", tabs: [{ id: "a", name: "One", text: "late" }] } });
+    await call(rpc.savePlace, { surface: "screen", place: { connectionId: saved.id, object: null, tab: "data" } });
+    expectThat((await call(rpc.getView, ref)).hiddenColumns.length === 0, "a late save brought a view back");
+    expectThat((await call(rpc.getQueryTabs, { connectionId: saved.id })).tabs === null, "a late save brought tabs back");
+    expectThat((await call(rpc.getPlace, { surface: "screen" })).place === null, "a late save brought a place back");
+  });
+  await lines.check("Save query drafts off keeps tab names and not text", async () => {
+    await applyPreferences({ keepDrafts: false });
+    const drafts = await call(rpc.saveConnection, { name: "drafts", ...base });
+    await call(rpc.saveQueryTabs, { connectionId: drafts.id, tabs: { activeId: "a", tabs: [{ id: "a", name: "One", text: "select secret" }] } });
+    const { tabs } = await call(rpc.getQueryTabs, { connectionId: drafts.id });
+    expectThat(tabs?.tabs[0]?.name === "One" && tabs.tabs[0].text === "", JSON.stringify(tabs));
+    expectThat(!readFileSync(join(folder, "workspace.json"), "utf8").includes("secret"), "text reached the disk");
+    await call(rpc.deleteConnection, { id: drafts.id });
+    await applyPreferences({});
+  });
+  await lines.check("history settings apply", async () => {
+    const saved = await call(rpc.saveConnection, { name: "history", ...base, safety: "open" });
+    const scope = { connectionId: saved.id };
+    const run = async (text: string) => finish(await call(rpc.runQuery, { scope, text }));
+    await run("select 1");
+    await run("select 2");
+    expectThat((await call(rpc.listHistory, { connectionId: saved.id })).entries.length === 2, "not recorded");
+    await applyPreferences({ keepHistory: false });
+    await run("select 3");
+    expectThat((await call(rpc.listHistory, { connectionId: saved.id })).entries.length === 2, "recorded with history off");
+    await applyPreferences({ historyLength: 0 });
+    expectThat((await call(rpc.listHistory, { connectionId: saved.id })).entries.length === 0, "0 did not remove what was there");
+    await applyPreferences({});
+    await call(rpc.deleteConnection, { id: saved.id });
+  });
+  await lines.check("the export folder preference is used", async () => {
+    await applyPreferences({ exportFolder: "~/dw-exports" });
+    const { path } = await call(rpc.defaultExportPath, { name: "t", format: "csv" });
+    expectThat(path.includes("dw-exports") && !path.includes("~"), path);
+    await applyPreferences({});
+  });
+  await lines.check("a file that is not SQLite is reported, and nothing opens it", async () => {
+    const other = join(folder, "not-sqlite.db");
+    writeFileSync(other, "just some text that is long enough to read a whole header from it, and then a little more than that");
+    const answer = await call(rpc.inspectSqlite, { path: other });
+    expectThat(!answer.isSqlite && !answer.wal, JSON.stringify(answer));
+    const short = join(folder, "short.db");
+    writeFileSync(short, "x");
+    expectThat(!(await call(rpc.inspectSqlite, { path: short })).isSqlite, "a short file passed");
+    expectThat(!existsSync(`${other}-wal`) && !existsSync(`${other}-journal`), "left a file beside it");
+  });
+  await lines.check("a real SQLite file and its journal mode are recognised", async () => {
+    const real = join(folder, "real.db");
+    writeFileSync(real, "");
+    const saved = await call(rpc.saveConnection, { name: "real", engine: "sqlite", file: real, safety: "open" });
+    await finish(await call(rpc.runQuery, { scope: { connectionId: saved.id }, text: "create table t (id integer primary key)" }));
+    await call(rpc.disconnect, { id: saved.id });
+    expectThat((await call(rpc.inspectSqlite, { path: real })).isSqlite, "not recognised");
+    expectThat(!(await call(rpc.inspectSqlite, { path: real })).wal, "reported WAL on a plain file");
+    await call(rpc.runQuery, { scope: { connectionId: saved.id }, text: "pragma journal_mode = wal", confirmed: true }).then((started) => (started.status === "started" ? waitJob(started.job) : null));
+    await call(rpc.disconnect, { id: saved.id });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expectThat((await call(rpc.inspectSqlite, { path: real })).wal, "did not report WAL");
+    await call(rpc.deleteConnection, { id: saved.id });
+  });
+  await lines.check("a damaged views file means defaults, and connections are untouched", async () => {
+    const before = await call(rpc.saveConnection, { name: "keep", ...base });
+    const fresh = mkdtempSync(join(tmpdir(), "datawise-damaged-"));
+    writeFileSync(join(fresh, "views.json"), "{ not json");
+    const file2 = new SideFile(() => Promise.resolve(fresh), "views.json", z.object({ views: z.record(z.string(), z.unknown()) }), () => ({ views: {} }));
+    expectThat(JSON.stringify(await file2.read()) === '{"views":{}}', "not empty");
+    expectThat(existsSync(join(fresh, "views.json.damaged")), "damaged file not set aside");
+    rmSync(fresh, { recursive: true, force: true });
+    await call(rpc.deleteConnection, { id: before.id });
+  });
+  lines.done();
+}
+
 async function sqliteSpec(): Promise<Spec> {
   const file = join(folder, "test.db");
   writeFileSync(file, "");
@@ -813,7 +1369,22 @@ async function main() {
   const wanted = process.argv.slice(2);
   console.log(`Runtime: Node ${process.version}, Electron ${process.versions.electron ?? "none"}, TZ ${process.env.TZ ?? "system"}`);
   const all: Record<string, Spec> = { sqlite: await sqliteSpec(), ...specs };
+  const featureSpecs = featureEngines();
+  const extras: Record<string, () => Promise<void>> = {
+    tls: runTls,
+    "ssh-keys": runSshKeys,
+    "readonly-folder": runReadOnlyFolder,
+    settings: runSettingsAndViews,
+    "agent-clickhouse": () => runAgentCatalog("clickhouse"),
+    "agent-cassandra": () => runAgentCatalog("cassandra"),
+    ...Object.fromEntries(Object.entries(featureSpecs).map(([key, spec]) => [`features-${key}`, () => runEngineFeatures(key, spec)])),
+  };
   for (const key of wanted.length > 0 ? wanted : Object.keys(all)) {
+    const extra = extras[key];
+    if (extra) {
+      await extra();
+      continue;
+    }
     const spec = all[key];
     if (!spec) throw new Error(`No spec named ${key}`);
     await runSpec(key, spec);

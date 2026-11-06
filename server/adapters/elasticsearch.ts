@@ -1,6 +1,7 @@
 import type { Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
 import { finishRows } from "../cells";
 import { errorMessage } from "../errors";
+import { tlsClientOptions } from "../tls";
 import { httpCall, type HttpTarget } from "../http";
 import { PartialRunError, STREAM_BATCH } from "./sql-base";
 import type { Adapter, AdapterContext, ParsedStatement, RunContext, StreamBatch, StreamSource, WritePlan } from "./types";
@@ -64,9 +65,7 @@ class ElasticAdapter implements Adapter {
       protocol: connection.tls === "off" ? "http:" : "https:",
       host: endpoint.host,
       port: endpoint.port,
-      servername: endpoint.tlsServername,
-      rejectUnauthorized: connection.tls === "verify",
-      ca: connection.caCertificate || undefined,
+      tls: tlsClientOptions(connection, endpoint),
       headers,
     };
   }

@@ -2,8 +2,9 @@ import { copyText, Modal, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
-import type { ColumnInfo, ConnectionView, ObjectRef, RowKey } from "../shared/contracts";
+import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowKey } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
+import { jumpFilters } from "../shared/foreign-keys";
 import { parseEdited } from "../shared/values";
 import { Btn, cellText, Chip, errorText, Field, isBytes, Message, useApi, useGuardedRun, useUi } from "./kit";
 
@@ -15,7 +16,7 @@ interface FieldState {
   touched: boolean;
 }
 
-export function RowForm({ connection, refObject, columns, keyColumns, keyReason, mode, onClose, onChanged, onDuplicate }: { connection: ConnectionView; refObject: ObjectRef; columns: ColumnInfo[]; keyColumns: string[]; keyReason: string | null; mode: RowFormMode; onClose: () => void; onChanged: () => void; onDuplicate: (values: Record<string, unknown>) => void }) {
+export function RowForm({ connection, refObject, columns, keyColumns, keyReason, mode, foreignKeys = [], onJump, onClose, onChanged, onDuplicate }: { connection: ConnectionView; refObject: ObjectRef; columns: ColumnInfo[]; keyColumns: string[]; keyReason: string | null; mode: RowFormMode; foreignKeys?: ObjectDetails["foreignKeys"]; onJump?: (key: ObjectDetails["foreignKeys"][number], filters: Filter[]) => void; onClose: () => void; onChanged: () => void; onDuplicate: (values: Record<string, unknown>) => void }) {
   const ui = useUi();
   const api = useApi();
   const toast = useToast();
@@ -114,6 +115,10 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
   const title = editing ? `Row in ${refObject.name}` : `New row in ${refObject.name}`;
   const editable = editing ? info.canEditRows && keyColumns.length > 0 && canWrite : info.canInsertRows && canWrite;
   const asObject = () => Object.fromEntries(shownColumns.map((column) => [column.name, original(column.name)]));
+  const jumps = editing && shownRow && onJump ? foreignKeys.flatMap((key) => {
+    const filters = jumpFilters(key, original);
+    return filters ? [{ key, filters }] : [];
+  }) : [];
 
   return (
     <Modal title={title} open onOpenChange={(open) => (open ? undefined : onClose())}>
@@ -146,6 +151,16 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
             </View>
           );
         })}
+        {jumps.length > 0 ? (
+          <View style={{ gap: 4 }}>
+            <Text style={ui.label}>Go to the row this points at</Text>
+            <View style={ui.wrap}>
+              {jumps.map(({ key, filters }) => (
+                <Btn key={key.name} icon="ArrowRight" label={`${key.columns.join(", ")} → ${key.targetTable}`} onPress={() => onJump?.(key, filters)} />
+              ))}
+            </View>
+          </View>
+        ) : null}
         {!editing || (schemaless && editable) ? (
           <View style={ui.row}>
             <View style={{ flex: 1 }}>

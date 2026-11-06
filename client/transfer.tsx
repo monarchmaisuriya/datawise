@@ -4,6 +4,7 @@ import { Text, View } from "react-native";
 import type { ConnectionView, ExportFormat, ExportSource, ImportFormat, JobView, ObjectRef } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import { Btn, cellText, Chip, errorText, Field, Message, Select, useApi, useGuardedRun, useUi, waitForJob } from "./kit";
+import { usePreferences } from "./preferences";
 
 const EXPORT_FORMATS: { value: ExportFormat; label: string }[] = [
   { value: "csv", label: "CSV" },
@@ -18,7 +19,9 @@ export function ExportModal({ connection, source, name, onClose }: { connection:
   const api = useApi();
   const toast = useToast();
   const info = ENGINES[connection.engine];
-  const [format, setFormat] = useState<ExportFormat>("csv");
+  const preferences = usePreferences();
+  // SQL inserts need a table, so that choice falls back on a database without them.
+  const [format, setFormat] = useState<ExportFormat>(preferences.exportFormat === "sql" && !info.exportSqlInserts ? "csv" : preferences.exportFormat);
   const [path, setPath] = useState("");
   const [job, setJob] = useState<JobView | null>(null);
   const [error, setError] = useState<string | null>(null);

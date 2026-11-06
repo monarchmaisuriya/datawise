@@ -1,5 +1,6 @@
 import type { ClientConfig, Pool as PgPool, PoolClient, QueryResult as PgResult } from "pg";
 import { loadDriver } from "../drivers";
+import { tlsClientOptions } from "../tls";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
 import { ansiQuote, SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
 import type { Adapter, AdapterContext } from "./types";
@@ -64,7 +65,7 @@ class PgDriver implements SqlDriver {
       database: database || connection.database || "postgres",
       connectionTimeoutMillis: 15000,
       application_name: "datawise",
-      ssl: connection.tls === "off" ? false : { rejectUnauthorized: connection.tls === "verify", ca: connection.caCertificate || undefined, servername: endpoint.tlsServername },
+      ssl: connection.tls === "off" ? false : tlsClientOptions(connection, endpoint),
     };
   }
 
@@ -199,7 +200,15 @@ class PgDriver implements SqlDriver {
        WHERE x.indrelid = $1::oid GROUP BY i.relname, x.indisprimary, x.indisunique, x.indpred ORDER BY x.indisprimary DESC, i.relname`,
       [relation.oid],
     );
-    const fkRows = await this.rows<{ name: string; definition: string }>(db, `SELECT conname AS name, pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid = $1::oid AND contype = 'f' ORDER BY conname`, [relation.oid]);
+    const fkRows = await this.rows<{ name: string; definition: string; target_schema: string; target_table: string; columns: string[]; target_columns: string[] }>(
+      db,
+      `SELECT c.conname AS name, pg_get_constraintdef(c.oid) AS definition, tn.nspname AS target_schema, t.relname AS target_table,
+         (SELECT array_agg(a.attname::text ORDER BY k.ord) FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS columns,
+         (SELECT array_agg(a.attname::text ORDER BY k.ord) FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS target_columns
+       FROM pg_constraint c JOIN pg_class t ON t.oid = c.confrelid JOIN pg_namespace tn ON tn.oid = t.relnamespace
+       WHERE c.conrelid = $1::oid AND c.contype = 'f' ORDER BY c.conname`,
+      [relation.oid],
+    );
     const primary = indexRows.find((row) => row.primary);
     // A full, non-partial unique index over non-null columns identifies a row as well as a primary key.
     const unique = indexRows.find((row) => row.unique && !row.partial && !row.nullable);
@@ -215,7 +224,7 @@ class PgDriver implements SqlDriver {
       keyColumns,
       keyReason: keyColumns.length > 0 ? null : kind === "table" ? `${ref.name} has no primary key or usable unique index, so its rows cannot be changed one at a time.` : `A ${kind} cannot be edited here.`,
       indexes: indexRows.map((row) => ({ name: row.name, columns: row.columns.map((name) => name ?? "(expression)"), unique: row.unique })),
-      foreignKeys: fkRows.map((row) => ({ name: row.name, columns: [], references: row.definition })),
+      foreignKeys: fkRows.map((row) => ({ name: row.name, columns: row.columns, references: row.definition, targetDatabase: null, targetSchema: row.target_schema, targetTable: row.target_table, targetColumns: row.target_columns })),
       definition,
       facts: [{ label: "Estimated rows", value: relation.estimate === "-1" ? "not analyzed yet" : relation.estimate }],
     };

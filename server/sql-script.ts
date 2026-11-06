@@ -86,6 +86,8 @@ export function splitStatements(source: string, dialect: SqlDialect): Statement[
     const isTrigger = dialect === "sqlite" && words[0] === "CREATE" && words.includes("TRIGGER");
     const isAtomic = dialect === "postgres" && upper === "ATOMIC" && words[words.length - 2] === "BEGIN";
     if ((isTrigger && upper === "BEGIN") || isAtomic) blockDepth += 1;
+    // T-SQL blocks hold ; of their own. BEGIN TRAN opens no block.
+    if (dialect === "mssql" && upper === "BEGIN" && !/^(?:TRAN|TRANSACTION|DISTRIBUTED)\b/i.test(source.slice(next, next + 14))) blockDepth += 1;
     if (blockDepth > 0 && upper === "CASE") blockDepth += 1;
     if (blockDepth > 0 && upper === "END") blockDepth -= 1;
   };

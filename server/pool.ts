@@ -4,7 +4,7 @@ import type { Adapter, Endpoint } from "./adapters/types";
 import type { Store, StoredConnection } from "./store";
 import { openTunnel, type Tunnel } from "./tunnel";
 
-const IDLE_CLOSE_MS = 10 * 60 * 1000;
+const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
 
 interface Live {
   adapter: Promise<Adapter>;
@@ -35,6 +35,7 @@ async function build(connection: StoredConnection, onTunnel: (tunnel: Tunnel) =>
 export class Pool {
   private readonly live = new Map<string, Live>();
   private readonly timer: NodeJS.Timeout;
+  private idleCloseMs = DEFAULT_IDLE_CLOSE_MS;
 
   constructor(private readonly store: Store) {
     this.timer = setInterval(() => this.closeIdle(), 60000);
@@ -43,7 +44,16 @@ export class Pool {
 
   private closeIdle() {
     const now = Date.now();
-    for (const [id, entry] of this.live) if (entry.busy === 0 && now - entry.lastUsed > IDLE_CLOSE_MS) void this.disconnect(id);
+    for (const [id, entry] of this.live) if (entry.busy === 0 && now - entry.lastUsed > this.idleCloseMs) void this.disconnect(id);
+  }
+
+  setIdleCloseMinutes(minutes: number) {
+    this.idleCloseMs = minutes * 60 * 1000;
+  }
+
+  // For callers that must not cause a connection, such as a search on every keystroke.
+  isOpen(connectionId: string): boolean {
+    return this.live.has(connectionId);
   }
 
   async use<T>(connectionId: string, work: (adapter: Adapter, connection: StoredConnection) => Promise<T>): Promise<T> {

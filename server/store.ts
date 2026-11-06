@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { type ConnectionView, connectionInput, type HistoryEntry, historyEntry, type SavedQuery, safetyMode, savedQuery, sshInput, tlsMode, engineId } from "../shared/contracts";
+import { agentAccess, connectionColor, type ConnectionView, connectionInput, environmentLabel, type HistoryEntry, historyEntry, type SavedQuery, safetyMode, savedQuery, sshInput, tlsMode, engineId } from "../shared/contracts";
+import { ENGINES } from "../shared/engines";
 import { registerSecret } from "./errors";
 
 const storedConnection = z.object({
@@ -24,6 +25,10 @@ const storedConnection = z.object({
   caCertificate: z.string().default(""),
   // Missing means the safe default. An unknown value fails the load instead of guessing a mode.
   safety: safetyMode.default("confirm"),
+  environment: environmentLabel.default("none"),
+  color: connectionColor.nullable().default(null),
+  group: z.string().default(""),
+  agentAccess: agentAccess.default("none"),
   ssh: sshInput.nullable().default(null),
   rememberPassword: z.boolean().default(true),
   sshHostFingerprint: z.string().nullable().default(null),
@@ -69,6 +74,10 @@ export function toView(connection: StoredConnection): ConnectionView {
     tls: connection.tls,
     caCertificate: connection.caCertificate,
     safety: connection.safety,
+    environment: connection.environment,
+    color: connection.color,
+    group: connection.group,
+    agentAccess: connection.agentAccess,
     ssh: connection.ssh,
     sshHostFingerprint: connection.sshHostFingerprint,
     rememberPassword: connection.rememberPassword,
@@ -88,14 +97,24 @@ export class Store {
   private state: StoreFile | null = null;
   private writes: Promise<unknown> = Promise.resolve();
 
+  private loading: Promise<StoreFile> | null = null;
+
   constructor(private readonly findFolder: () => Promise<string>) {}
 
   private async path(): Promise<string> {
     return join(await this.findFolder(), "connections.json");
   }
 
-  private async load(): Promise<StoreFile> {
-    if (this.state) return this.state;
+  // One shared load, so two first callers cannot each hold their own copy and lose the other's save.
+  private load(): Promise<StoreFile> {
+    this.loading ??= this.read().catch((error: unknown) => {
+      this.loading = null;
+      throw error;
+    });
+    return this.loading;
+  }
+
+  private async read(): Promise<StoreFile> {
     let raw: string | null = null;
     try {
       raw = await readFile(await this.path(), "utf8");
@@ -140,6 +159,12 @@ export class Store {
   // Applies a form to a stored connection, without saving. Also used by Test on an unsaved form.
   async resolveInput(rawInput: unknown): Promise<StoredConnection> {
     const input = connectionInput.parse(rawInput);
+    // Held here, the one path every saved connection takes, so no client can get around them.
+    if (input.environment === "production" && input.safety === "open") throw new Error("A production connection cannot run without prompts. Choose Ask first or Read-only.");
+    if (input.agentAccess !== "none") {
+      if (input.environment === "production") throw new Error("A production connection cannot be shared with agents.");
+      if (!ENGINES[input.engine].catalogSchema) throw new Error(`${ENGINES[input.engine].label} structure comes from the data itself, so it cannot be shared with agents without sharing data.`);
+    }
     const existing = input.id ? (await this.load()).connections.find((item) => item.id === input.id) : undefined;
     const secret = (field: (typeof SECRET_FIELDS)[number]): string | null => {
       const change = input[field];
@@ -192,11 +217,18 @@ export class Store {
     return connection;
   }
 
-  async addHistory(connectionId: string, entry: Omit<HistoryEntry, "id" | "ranAt">): Promise<void> {
+  async addHistory(connectionId: string, entry: Omit<HistoryEntry, "id" | "ranAt">, limit = HISTORY_LIMIT): Promise<void> {
     const state = await this.load();
     const entries = state.history[connectionId] ?? [];
     entries.unshift({ ...entry, id: randomUUID(), ranAt: new Date().toISOString() });
-    state.history[connectionId] = entries.slice(0, HISTORY_LIMIT);
+    state.history[connectionId] = entries.slice(0, limit);
+    await this.persist();
+  }
+
+  // Applied when the setting changes, so 0 removes what is there now and not at some later run.
+  async trimHistory(limit: number): Promise<void> {
+    const state = await this.load();
+    for (const [id, entries] of Object.entries(state.history)) state.history[id] = entries.slice(0, limit);
     await this.persist();
   }
 

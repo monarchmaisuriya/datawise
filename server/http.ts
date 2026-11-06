@@ -1,14 +1,14 @@
 import { type IncomingMessage, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import type { ConnectionOptions } from "node:tls";
 
 export interface HttpTarget {
   protocol: "http:" | "https:";
   host: string;
   port: number;
   // Name checked against the certificate; differs from host behind an SSH tunnel.
-  servername?: string;
-  rejectUnauthorized: boolean;
-  ca?: string;
+  // Node's TLS options, from tlsClientOptions, so the certificate is checked against the named host.
+  tls: ConnectionOptions;
   headers: Record<string, string>;
 }
 
@@ -36,9 +36,7 @@ export function httpOpen(target: HttpTarget, method: string, path: string, body:
         port: target.port,
         method,
         path: safePath,
-        servername: target.servername,
-        rejectUnauthorized: target.rejectUnauthorized,
-        ca: target.ca || undefined,
+        ...target.tls,
         signal: options.signal,
         headers: { ...target.headers, ...(body !== null ? { "content-type": options.contentType ?? "text/plain", "content-length": Buffer.byteLength(body) } : {}) },
       },
@@ -62,9 +60,7 @@ export function httpCall(target: HttpTarget, method: string, path: string, body:
         port: target.port,
         method,
         path: safePath,
-        servername: target.servername,
-        rejectUnauthorized: target.rejectUnauthorized,
-        ca: target.ca || undefined,
+        ...target.tls,
         signal: options.signal,
         timeout: options.timeoutMs ?? 60000,
         headers: { ...target.headers, ...(body !== null ? { "content-type": options.contentType ?? "application/json", "content-length": Buffer.byteLength(body) } : {}) },

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Redis, RedisOptions } from "ioredis";
 import { loadDriver } from "../drivers";
+import { tlsClientOptions } from "../tls";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, WriteOp } from "../../shared/contracts";
 import { finishRows } from "../cells";
 import { errorMessage } from "../errors";
@@ -121,7 +122,7 @@ class RedisAdapter implements Adapter {
           // Pipelines keep the order, and offline commands fail right away instead of waiting.
           enableOfflineQueue: false,
           retryStrategy: () => null,
-          tls: connection.tls === "off" ? undefined : { rejectUnauthorized: connection.tls === "verify", ca: connection.caCertificate || undefined, servername: endpoint.tlsServername },
+          tls: connection.tls === "off" ? undefined : tlsClientOptions(connection, endpoint),
         };
         const instance = new IORedis(options);
         instance.on("error", () => undefined);

@@ -1,4 +1,4 @@
-import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
+import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, StagedEdit, WriteOp } from "../../shared/contracts";
 import { finishRows, fromCell } from "../cells";
 import { errorMessage } from "../errors";
 import { splitStatements, type SqlDialect } from "../sql-script";
@@ -41,6 +41,8 @@ export interface SqlDialectRules {
   drop(table: string, kind: string): string;
   // What a grid SELECT reads. Defaults to *.
   projection?(columns: ColumnInfo[]): string;
+  // A reason this table cannot commit several edits as one, such as a storage engine without rollback.
+  batchBlocker?(details: ObjectDetails): string | null;
   // Names a column in ORDER BY when the projection may hide it behind an alias of the same name.
   orderColumn?(table: string, column: string): string;
   // How many rows one INSERT may carry. Defaults to one row per statement.
@@ -145,6 +147,13 @@ function withoutRoundedKeys(details: ObjectDetails): ObjectDetails {
   const rounded = details.keyColumns.filter((name) => /float|double|real/i.test(details.columns.find((column) => column.name === name)?.type ?? ""));
   if (rounded.length === 0) return details;
   return { ...details, keyColumns: [], keyReason: `The key column ${rounded.join(", ")} holds floating point values, which cannot be matched exactly, so rows cannot be changed one at a time.` };
+}
+
+// Rows from a catalog query, grouped in the order each group first appears.
+export function groupRows<T>(rows: T[], keyOf: (row: T) => string): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) groups.set(keyOf(row), [...(groups.get(keyOf(row)) ?? []), row]);
+  return groups;
 }
 
 export class SqlAdapter implements Adapter {
@@ -344,6 +353,81 @@ export class SqlAdapter implements Adapter {
         throw error;
       }
     }, WRITE_DEADLINE_MS);
+  }
+
+  async planBatch(ref: ObjectRef, edits: StagedEdit[]): Promise<WritePlan> {
+    if (!this.driver.transactional) throw new Error("This engine cannot commit several edits as one.");
+    const details = await this.describe(ref);
+    requireKey(ref, details.keyColumns, details.keyReason);
+    const blocker = this.rules.batchBlocker?.(details);
+    if (blocker) throw new Error(blocker);
+    const table = this.rules.table(ref);
+    const seen = new Set<string>();
+    const shown: string[] = [];
+    const steps = edits.map((edit) => {
+      // One operation per row. With two, a later key could name a row an earlier edit moved, and every
+      // row count would still look right while the wrong row changed.
+      const id = JSON.stringify(details.keyColumns.map((name) => edit.key[name]));
+      if (seen.has(id)) throw new Error(`Two edits name the same row: ${id}. Nothing was changed.`);
+      seen.add(id);
+      const read = this.keyWhere(details, ref, edit.key, 1);
+      const readSql = `SELECT ${this.projection(details)} FROM ${table} WHERE ${read.sql}`;
+      if (edit.kind === "delete") {
+        shown.push(`DELETE FROM ${table} WHERE ${read.shown}`);
+        return { readSql, readParams: read.params, label: read.shown, original: edit.original, sql: `DELETE FROM ${table} WHERE ${read.sql}`, params: read.params };
+      }
+      const names = Object.keys(edit.changes);
+      if (names.length === 0) throw new Error("An edit changes nothing.");
+      this.checkColumns(details, names);
+      for (const name of names) if (details.keyColumns.includes(name)) throw new Error(`The key column ${name} cannot be changed with pending edits. Open the row and save it on its own.`);
+      const values = names.map((name) =>
+        this.rules.bind(
+          fromCell(edit.changes[name]),
+          details.columns.find((column) => column.name === name),
+        ),
+      );
+      const write = this.keyWhere(details, ref, edit.key, values.length + 1);
+      const assign = names.map((name, index) => `${this.rules.quote(name)} = ${this.rules.placeholder(index + 1)}`).join(", ");
+      shown.push(`UPDATE ${table} SET ${names.map((name, index) => `${this.rules.quote(name)} = ${renderLiteral(values[index])}`).join(", ")} WHERE ${read.shown}`);
+      return { readSql, readParams: read.params, label: read.shown, original: Object.fromEntries(names.map((name) => [name, edit.original[name] ?? null])), sql: `UPDATE ${table} SET ${assign} WHERE ${write.sql}`, params: [...values, ...write.params] };
+    });
+    const preview = shown.slice(0, 50);
+    if (shown.length > 50) preview.push(`...and ${shown.length - 50} more`);
+    return {
+      preview: preview.join("\n"),
+      run: () =>
+        this.withPooled(
+          ref,
+          async (session) => {
+            await session.begin(false);
+            try {
+              let affected = 0;
+              for (const step of steps) {
+                // Compares values, not just counts: pending edits can be hours old, and a key can come
+                // to name a different row. A small window remains between this read and the write.
+                const current = await this.fetch(session, step.readSql, step.readParams, 2);
+                if (current.rows.length !== 1) throw new Error(`The row ${step.label} no longer exists. Nothing was changed.`);
+                const cells = finishRows(current.rows, null, Number.MAX_SAFE_INTEGER).rows[0];
+                // Too large to return whole. Comparing nothing would let a stale edit through.
+                if (!cells) throw new Error(`The row ${step.label} is too large to compare. Nothing was changed. Open the row and save it on its own.`);
+                for (const [name, expected] of Object.entries(step.original)) {
+                  const position = current.columns.findIndex((column) => column.name === name);
+                  if (position === -1 || JSON.stringify(cells[position] ?? null) !== JSON.stringify(expected)) throw new Error(`${name} in the row ${step.label} changed after you edited it. Nothing was changed. Discard the pending edits and make them again on the current values.`);
+                }
+                const result = await this.fetch(session, step.sql, step.params, 1);
+                if ((result.affected ?? 0) !== 1) throw new Error(`The edit to ${step.label} matched ${result.affected ?? 0} rows. Nothing was changed.`);
+                affected += 1;
+              }
+              await session.commit();
+              return affected;
+            } catch (error) {
+              await session.rollback().catch(() => undefined);
+              throw error;
+            }
+          },
+          WRITE_DEADLINE_MS,
+        ),
+    };
   }
 
   async planDestroy(ref: ObjectRef, action: "drop" | "truncate"): Promise<WritePlan> {

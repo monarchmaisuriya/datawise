@@ -79,6 +79,12 @@ describe("statement splitting", () => {
     expect(splitStatements("begin null; null; end;\n/\nselect 1 from dual", "oracle")).toHaveLength(2);
   });
 
+  it("keeps a T-SQL block whole, and does not take BEGIN TRAN for one", () => {
+    expect(splitStatements("IF 1=1 BEGIN DELETE FROM t; DELETE FROM u; END; SELECT 1", "mssql")).toHaveLength(2);
+    expect(splitStatements("BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; END CATCH", "mssql")).toHaveLength(1);
+    expect(splitStatements("BEGIN TRAN; DELETE FROM t; COMMIT", "mssql")).toHaveLength(3);
+  });
+
   it("follows DELIMITER on MySQL", () => {
     expect(splitStatements("DELIMITER //\ncreate procedure p() begin select 1; end//\nDELIMITER ;\nselect 2;", "mysql")).toHaveLength(2);
   });

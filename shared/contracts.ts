@@ -1,4 +1,4 @@
-import { defineRpc } from "@getpaseo/plugin";
+import { defineAttachmentSource, defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import { ENGINE_IDS, FILTER_OPS } from "./engines";
 
@@ -10,6 +10,12 @@ export const safetyMode = z.enum(["read-only", "confirm", "open"]);
 export type SafetyMode = z.infer<typeof safetyMode>;
 export const tlsMode = z.enum(["off", "require", "verify"]);
 export type TlsMode = z.infer<typeof tlsMode>;
+export const environmentLabel = z.enum(["none", "development", "staging", "production"]);
+export type EnvironmentLabel = z.infer<typeof environmentLabel>;
+export const connectionColor = z.enum(["red", "amber", "green", "gray", "contrast"]);
+export type ConnectionColor = z.infer<typeof connectionColor>;
+export const agentAccess = z.enum(["none", "schema"]);
+export type AgentAccess = z.infer<typeof agentAccess>;
 
 // A secret in a save request: missing keeps the stored value, null clears it, a string replaces it.
 const secretChange = z.string().nullable().optional();
@@ -39,6 +45,10 @@ export const connectionInput = z.object({
   tls: tlsMode.default("off"),
   caCertificate: z.string().default(""),
   safety: safetyMode.default("confirm"),
+  environment: environmentLabel.default("none"),
+  color: connectionColor.nullable().default(null),
+  group: z.string().trim().max(60).default(""),
+  agentAccess: agentAccess.default("none"),
   ssh: sshInput.nullable().default(null),
   // False keeps the password in memory only, so it is asked for again after Paseo restarts.
   rememberPassword: z.boolean().default(true),
@@ -69,6 +79,10 @@ export const connectionView = z.object({
   tls: tlsMode,
   caCertificate: z.string(),
   safety: safetyMode,
+  environment: environmentLabel,
+  color: connectionColor.nullable(),
+  group: z.string(),
+  agentAccess,
   ssh: sshInput.nullable(),
   sshHostFingerprint: z.string().nullable(),
   rememberPassword: z.boolean(),
@@ -136,7 +150,18 @@ export const objectDetails = z.object({
   // Why rows cannot be edited, when keyColumns is empty.
   keyReason: z.string().nullable(),
   indexes: z.array(z.object({ name: z.string(), columns: z.array(z.string()), unique: z.boolean() })),
-  foreignKeys: z.array(z.object({ name: z.string(), columns: z.array(z.string()), references: z.string() })),
+  // The target fields are null when the engine's catalog does not settle them. No jump is offered then.
+  foreignKeys: z.array(
+    z.object({
+      name: z.string(),
+      columns: z.array(z.string()),
+      references: z.string(),
+      targetDatabase: z.string().nullable(),
+      targetSchema: z.string().nullable(),
+      targetTable: z.string().nullable(),
+      targetColumns: z.array(z.string()),
+    }),
+  ),
   definition: z.string().nullable(),
   // Short facts such as a key's type and time to live.
   facts: z.array(z.object({ label: z.string(), value: z.string() })),
@@ -164,6 +189,42 @@ export const writeOp = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delete"), keys: z.array(rowKey).min(1).max(1000) }),
 ]);
 export type WriteOp = z.infer<typeof writeOp>;
+
+// A staged edit. original holds what the user saw, compared again before writing: the changed columns of an
+// update, and every whole value of a row to delete, so a delete cannot remove a row that has since changed.
+export const stagedEdit = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("update"), key: rowKey, original: z.record(z.string(), z.unknown()), changes: z.record(z.string(), z.unknown()) }),
+  z.object({ kind: z.literal("delete"), key: rowKey, original: z.record(z.string(), z.unknown()) }),
+]);
+export type StagedEdit = z.infer<typeof stagedEdit>;
+
+export const savedFilter = z.object({ name: z.string().trim().min(1).max(60), filters: z.array(filter).max(20) });
+export type SavedFilter = z.infer<typeof savedFilter>;
+
+// How one table is shown. Positions are never stored: column names are, so a changed table stays readable.
+export const savedView = z.object({
+  hiddenColumns: z.array(z.string()).default([]),
+  columnOrder: z.array(z.string()).default([]),
+  sort: sort.nullable().default(null),
+  // What is applied now, so a table opens as it was left.
+  filtersInUse: z.array(filter).max(20).default([]),
+  filters: z.array(savedFilter).default([]),
+});
+export type SavedView = z.infer<typeof savedView>;
+
+export const savedPlace = z.object({
+  connectionId: z.string(),
+  database: z.string().optional(),
+  schema: z.string().optional(),
+  object: z.object({ name: z.string(), kind: z.string() }).nullable(),
+  tab: z.enum(["data", "structure", "query"]),
+});
+export type SavedPlace = z.infer<typeof savedPlace>;
+
+export const queryTabRecord = z.object({ id: z.string(), name: z.string().max(60), text: z.string().max(1024 * 1024) });
+export type QueryTabRecord = z.infer<typeof queryTabRecord>;
+export const queryTabs = z.object({ activeId: z.string(), tabs: z.array(queryTabRecord).max(30) });
+export type QueryTabs = z.infer<typeof queryTabs>;
 
 export const queryResult = z.object({
   statement: z.string(),
@@ -277,6 +338,12 @@ export const rpc = {
   countRows: defineRpc({ name: "data.count", input: z.object({ ref: objectRef, filters: z.array(filter).max(20).default([]) }), output: jobView }),
   readRow: defineRpc({ name: "data.read-row", input: z.object({ ref: objectRef, key: rowKey }), output: rowPage }),
   writeRows: defineRpc({ name: "data.write", input: z.object({ ref: objectRef, op: writeOp, confirmed: z.boolean().default(false) }), output: startResult }),
+  // dryRun plans everything and returns the preview without writing. A key problem shows up here.
+  writeBatch: defineRpc({
+    name: "data.write-batch",
+    input: z.object({ ref: objectRef, edits: z.array(stagedEdit).min(1).max(1000), dryRun: z.boolean().default(false), confirmed: z.boolean().default(false) }),
+    output: startResult,
+  }),
   // confirmName must equal the object's name; the server checks it.
   destroyObject: defineRpc({
     name: "data.destroy",
@@ -325,6 +392,43 @@ export const rpc = {
     input: z.object({ source: exportSource, format: exportFormat }),
     output: jobView,
   }),
+  getView: defineRpc({ name: "views.get", input: objectRef, output: savedView }),
+  saveView: defineRpc({ name: "views.save", input: z.object({ ref: objectRef, view: savedView }), output: ok }),
+  getPlace: defineRpc({ name: "workspace.place.get", input: z.object({ surface: z.string() }), output: z.object({ place: savedPlace.nullable() }) }),
+  savePlace: defineRpc({ name: "workspace.place.save", input: z.object({ surface: z.string(), place: savedPlace.nullable() }), output: ok }),
+  getQueryTabs: defineRpc({ name: "workspace.tabs.get", input: z.object({ connectionId: z.string() }), output: z.object({ tabs: queryTabs.nullable() }) }),
+  saveQueryTabs: defineRpc({ name: "workspace.tabs.save", input: z.object({ connectionId: z.string(), tabs: queryTabs }), output: ok }),
+  // Reads only the file's first bytes, so it cannot change the file or create anything beside it.
+  inspectSqlite: defineRpc({ name: "sqlite.inspect", input: z.object({ path: z.string().min(1) }), output: z.object({ isSqlite: z.boolean(), wal: z.boolean() }) }),
   jobStatus: defineRpc({ name: "jobs.status", input: byId, output: jobView }),
   cancelJob: defineRpc({ name: "jobs.cancel", input: byId, output: ok }),
 };
+
+// A person picks an item, and its text is added to their prompt. Search must return the text right away,
+// so it holds structure only: reading rows here would read every match on every keystroke.
+export const searchStructure = defineRpc({
+  name: "attachments.structure",
+  input: z.object({ query: z.string() }),
+  output: z.object({
+    items: z.array(
+      z.object({
+        id: z.string(),
+        identifier: z.string(),
+        title: z.string(),
+        subtitle: z.string().optional(),
+        url: z.string().url(),
+        text: z.string(),
+        resourceType: z.string(),
+      }),
+    ),
+  }),
+});
+
+export const structureAttachment = defineAttachmentSource({
+  id: "table-structure",
+  title: "Table structure",
+  icon: "Table2",
+  pickerTitle: "Attach a table's structure",
+  searchPlaceholder: "Table name",
+  search: searchStructure,
+});

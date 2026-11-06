@@ -1,3 +1,4 @@
+import { connect, isIP } from "node:net";
 import type { Connection, FieldPacket, Pool, PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { loadDriver } from "../drivers";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
@@ -18,6 +19,11 @@ const rules: SqlDialectRules = {
   emptyInsert: (table) => `INSERT INTO ${table} () VALUES ()`,
   bind: (value) => (value !== null && typeof value === "object" && !(value instanceof Uint8Array) ? JSON.stringify(value) : value),
   maxInsertRows: (columnCount) => Math.floor(60000 / columnCount),
+  // Without rollback, a failure part way would leave some edits in place.
+  batchBlocker(details) {
+    const engine = details.facts.find((fact) => fact.label === "Storage engine")?.value;
+    return engine?.toLowerCase() === "innodb" ? null : `${details.name} uses the ${engine ?? "unknown"} storage engine, which cannot undo a partial write. Save these rows one at a time.`;
+  },
   truncate: (table) => `TRUNCATE TABLE ${table}`,
   drop: (table, kind) => (kind === "view" ? `DROP VIEW ${table}` : `DROP TABLE ${table}`),
 };
@@ -41,9 +47,14 @@ class MysqlDriver implements SqlDriver {
   private options() {
     const { connection, endpoint } = this.context;
     if (!endpoint) throw new Error("MySQL needs a host.");
+    // mysql2 skips its host name check for an IP address, so verified mode would not verify the name.
+    if (connection.tls === "verify" && isIP(connection.host)) throw new Error("Verified encryption on MySQL needs a host name, not an IP address. Use the name on the server's certificate, or choose Required.");
     return {
-      host: endpoint.host,
-      port: endpoint.port,
+      // mysql2 checks the certificate against this host, and offers no way to name another. So behind a
+      // tunnel it gets the host the user named, and the socket is supplied separately.
+      host: connection.host,
+      port: connection.port ?? endpoint.port,
+      stream: endpoint.host === connection.host ? undefined : () => connect(endpoint.port, endpoint.host),
       user: connection.user || undefined,
       password: connection.password ?? undefined,
       database: connection.database || undefined,
@@ -57,7 +68,7 @@ class MysqlDriver implements SqlDriver {
       rowsAsArray: true,
       // As text: parsing JSON would round large numbers, and an edit would then store the rounded value.
       jsonStrings: true,
-      ssl: connection.tls === "off" ? undefined : { rejectUnauthorized: connection.tls === "verify", ca: connection.caCertificate || undefined, servername: endpoint.tlsServername },
+      ssl: connection.tls === "off" ? undefined : { rejectUnauthorized: connection.tls === "verify", verifyIdentity: connection.tls === "verify", ca: connection.caCertificate || undefined },
     };
   }
 
@@ -234,7 +245,7 @@ class MysqlDriver implements SqlDriver {
     const list = [...indexes.values()];
     const key = indexes.get("PRIMARY") ?? list.find((index) => index.unique && index.usable);
     const keyColumns = kind === "table" ? (key?.columns ?? []) : [];
-    const fks = await this.rows("SELECT CONSTRAINT_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION), REFERENCED_TABLE_NAME, GROUP_CONCAT(REFERENCED_COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL GROUP BY CONSTRAINT_NAME, REFERENCED_TABLE_NAME", [database, ref.name]);
+    const fks = await this.rows("SELECT CONSTRAINT_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION), REFERENCED_TABLE_NAME, GROUP_CONCAT(REFERENCED_COLUMN_NAME ORDER BY ORDINAL_POSITION), REFERENCED_TABLE_SCHEMA FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL GROUP BY CONSTRAINT_NAME, REFERENCED_TABLE_NAME, REFERENCED_TABLE_SCHEMA", [database, ref.name]);
     const definition = await this.rows(`SHOW CREATE ${kind === "view" ? "VIEW" : "TABLE"} ${rules.table({ ...ref, database })}`);
     return {
       name: ref.name,
@@ -246,7 +257,7 @@ class MysqlDriver implements SqlDriver {
       keyColumns,
       keyReason: keyColumns.length > 0 ? null : kind === "table" ? `${ref.name} has no primary key or usable unique index, so its rows cannot be changed one at a time.` : "A view cannot be edited here.",
       indexes: list.map(({ name, columns: names, unique }) => ({ name, columns: names, unique })),
-      foreignKeys: fks.map((row) => ({ name: String(row[0]), columns: String(row[1]).split(","), references: `${String(row[2])} (${String(row[3])})` })),
+      foreignKeys: fks.map((row) => ({ name: String(row[0]), columns: String(row[1]).split(","), references: `${String(row[2])} (${String(row[3])})`, targetDatabase: String(row[4]), targetSchema: null, targetTable: String(row[2]), targetColumns: String(row[3]).split(",") })),
       definition: definition[0] ? String(definition[0][1]) : null,
       facts: [
         { label: "Estimated rows", value: String(table[1] ?? "unknown") },

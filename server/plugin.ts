@@ -4,16 +4,22 @@ import { dirname, isAbsolute, join } from "node:path";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { inferValue } from "../shared/values";
-import { type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, rpc, type Scope, type StartResult } from "../shared/contracts";
+import { open as openFile } from "node:fs/promises";
+import { type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import type { Adapter, StreamSource, WritePlan } from "./adapters/types";
+import { createDescribeTool, agentMayRead } from "./agent-tool";
 import { dataFolder } from "./paseo-home";
 import { errorMessage, guard } from "./errors";
 import { exporterFor, openOutput, readRecords, sqlTextFor, writeChunk } from "./formats";
 import { type JobOutcome, Jobs } from "./jobs";
 import { Pool } from "./pool";
+import { PreferencesReader, preferencesDocument } from "./preferences";
+import { SideFile } from "./side-file";
+import { structureOf, structureText } from "./structure";
 import { checkDestroyName, gate } from "./safety";
 import { Store, toView } from "./store";
+import { z } from "zod";
 
 // Under the daemon's 30 second limit on any RPC, so the user sees this message rather than a timeout.
 const READ_DEADLINE_MS = 25000;
@@ -62,16 +68,59 @@ function sourceName(source: ExportSource): string {
 }
 
 // folder is for the test bed, which has no Paseo daemon to ask.
-export function contributeServer(server: Pick<PluginServerContext, "handle">, folder?: string) {
-  const store = new Store(folder ? () => Promise.resolve(folder) : dataFolder);
+const onStray = (error: unknown) => console.error("Datawise: stray driver error:", errorMessage(error));
+
+const ATTACHMENT_MATCHES = 10;
+const EMPTY_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [] };
+
+function viewKey(ref: ObjectRef): string {
+  return JSON.stringify([ref.connectionId, ref.database ?? null, ref.schema ?? null, ref.name]);
+}
+
+export function contributeServer(server: Pick<PluginServerContext, "handle" | "registerSettings" | "addHook">, folder?: string) {
+  const findFolder = folder ? () => Promise.resolve(folder) : dataFolder;
+  const store = new Store(findFolder);
   const pool = new Pool(store);
   const jobs = new Jobs();
+  const views = new SideFile(findFolder, "views.json", z.object({ views: z.record(z.string(), savedView) }), () => ({ views: {} }));
+  const workspace = new SideFile(findFolder, "workspace.json", z.object({ places: z.record(z.string(), savedPlace), tabs: z.record(z.string(), queryTabs) }), () => ({ places: {}, tabs: {} }));
+  const preferences = new PreferencesReader(server.registerSettings(preferencesDocument) as never, (values) => {
+    pool.setIdleCloseMinutes(values.idleCloseMinutes);
+    void store.trimHistory(values.historyLength).catch((error: unknown) => onStray(error));
+  });
+  void preferences.get().then((values) => pool.setIdleCloseMinutes(values.idleCloseMinutes));
+
+  // Declaring this hook makes every open agent session reopen, even if the handler changes nothing, so it
+  // exists only while a connection is shared. The handler does no work, because one that throws would stop
+  // every agent on the daemon from opening a session.
+  // A save still on its way when a connection is deleted must not bring back what the delete removed.
+  const connectionExists = async (id: string) => (await store.listConnections()).some((item) => item.id === id);
+
+  const describeTool = createDescribeTool(store, pool);
+  let removeAgentHook: (() => void) | null = null;
+  const syncAgentHook = async () => {
+    const wanted = (await store.listConnections()).some(agentMayRead);
+    if (wanted && !removeAgentHook) removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, describeTool] }));
+    if (!wanted && removeAgentHook) {
+      removeAgentHook();
+      removeAgentHook = null;
+    }
+  };
 
   // Sockets die, and a driver event with no listener would otherwise end this process and every job in
   // it. Log it, without details that could hold a secret, and let the pool rebuild on the next request.
-  const onStray = (error: unknown) => console.error("Datawise: stray driver error:", errorMessage(error));
   process.on("uncaughtException", onStray);
   process.on("unhandledRejection", onStray);
+  void syncAgentHook().catch(onStray);
+
+  const startBatch = async (ref: ObjectRef, input: RpcInput<typeof rpc.writeBatch>, stillWanted: () => void): Promise<StartResult> =>
+    pool.use(ref.connectionId, async (adapter, connection) => {
+      if (!ENGINES[connection.engine].transactionalEdits || !adapter.planBatch) throw new Error(`${ENGINES[connection.engine].label} cannot commit several edits as one.`);
+      gate({ mode: connection.safety === "read-only" ? "read-only" : "open", writes: true, confirmed: true, preview: `Write to ${ref.name}` });
+      const plan = await adapter.planBatch(ref, input.edits);
+      if (input.dryRun) return { status: "confirm" as const, preview: plan.preview, reason: `${input.edits.length} edit${input.edits.length === 1 ? "" : "s"}, committed together or not at all.` };
+      return startPlan(ref.connectionId, plan, input.confirmed, connection.safety, stillWanted);
+    });
 
   const startPlan = (connectionId: string, plan: WritePlan, confirmed: boolean, mode: Parameters<typeof gate>[0]["mode"], stillWanted: () => void): StartResult => {
     const answer = gate({ mode, writes: true, confirmed, preview: plan.preview });
@@ -88,6 +137,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
       const saved = await store.saveConnection(input);
       // The next request connects with the new settings.
       await pool.disconnect(saved.id);
+      await syncAgentHook();
       return toView(saved);
     }),
   );
@@ -96,6 +146,15 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
     guard(async ({ id }: { id: string }) => {
       await pool.disconnect(id);
       await store.deleteConnection(id);
+      await syncAgentHook();
+      const prefix = JSON.stringify([id]).slice(0, -1);
+      await views.update((state) => {
+        for (const key of Object.keys(state.views)) if (key.startsWith(prefix)) delete state.views[key];
+      });
+      await workspace.update((state) => {
+        delete state.tabs[id];
+        for (const [surface, place] of Object.entries(state.places)) if (place.connectionId === id) delete state.places[surface];
+      });
       return { ok: true as const };
     }),
   );
@@ -146,6 +205,89 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
       ),
     ),
   );
+  server.handle(rpc.writeBatch, guard(async (input: RpcInput<typeof rpc.writeBatch>) => withStartDeadline((stillWanted) => startBatch(input.ref, input, stillWanted))));
+  server.handle(rpc.getView, guard(async (ref: ObjectRef) => (await views.read()).views[viewKey(ref)] ?? EMPTY_VIEW));
+  server.handle(
+    rpc.saveView,
+    guard(async ({ ref, view }: RpcInput<typeof rpc.saveView>) => {
+      if (!(await connectionExists(ref.connectionId))) return { ok: true as const };
+      await views.update((state) => {
+        state.views[viewKey(ref)] = view;
+      });
+      return { ok: true as const };
+    }),
+  );
+  server.handle(rpc.getPlace, guard(async ({ surface }: { surface: string }) => ({ place: (await workspace.read()).places[surface] ?? null })));
+  server.handle(
+    rpc.savePlace,
+    guard(async ({ surface, place }: RpcInput<typeof rpc.savePlace>) => {
+      if (place && !(await connectionExists(place.connectionId))) return { ok: true as const };
+      await workspace.update((state) => {
+        if (place) state.places[surface] = place;
+        else delete state.places[surface];
+      });
+      return { ok: true as const };
+    }),
+  );
+  server.handle(rpc.getQueryTabs, guard(async ({ connectionId }: { connectionId: string }) => ({ tabs: (await workspace.read()).tabs[connectionId] ?? null })));
+  server.handle(
+    rpc.saveQueryTabs,
+    guard(async ({ connectionId, tabs }: RpcInput<typeof rpc.saveQueryTabs>) => {
+      if (!(await connectionExists(connectionId))) return { ok: true as const };
+      // With drafts off, tab names stay and the text does not reach the disk.
+      const { keepDrafts } = await preferences.get();
+      await workspace.update((state) => {
+        state.tabs[connectionId] = keepDrafts ? tabs : { ...tabs, tabs: tabs.tabs.map((tab) => ({ ...tab, text: "" })) };
+      });
+      return { ok: true as const };
+    }),
+  );
+  server.handle(
+    rpc.inspectSqlite,
+    guard(async ({ path }: { path: string }) => {
+      const handle = await openFile(path, "r");
+      try {
+        const { buffer, bytesRead } = await handle.read(Buffer.alloc(100), 0, 100, 0);
+        const isSqlite = bytesRead >= 100 && buffer.subarray(0, 16).toString("latin1") === "SQLite format 3\0";
+        // Bytes 18 and 19 hold the write and read versions, and 2 means write-ahead logging.
+        return { isSqlite, wal: isSqlite && (buffer[18] === 2 || buffer[19] === 2) };
+      } finally {
+        await handle.close();
+      }
+    }),
+  );
+  server.handle(
+    searchStructure,
+    guard(async ({ query }: { query: string }) =>
+      withDeadline(
+        (async () => {
+          const needle = query.trim();
+          const items: { id: string; identifier: string; title: string; subtitle: string; url: string; text: string; resourceType: string }[] = [];
+          if (needle === "") return { items };
+          // Only connections already open, so a search can never start one, ask for a password, or reach
+          // a server nobody is using. Production stays out, as with agent access.
+          const usable = (await store.listConnections()).filter((item) => pool.isOpen(item.id) && item.environment !== "production" && ENGINES[item.engine].catalogSchema);
+          for (const connection of usable) {
+            if (items.length >= ATTACHMENT_MATCHES) break;
+            // One server failing must not empty the picker for the rest.
+            await pool.use(connection.id, async (adapter) => {
+              const info = ENGINES[connection.engine];
+              const database = info.databaseLabel ? connection.database || (await adapter.listDatabases())[0] : undefined;
+              const schema = info.schemaLabel ? (await adapter.listSchemas({ connectionId: connection.id, database }))[0] : undefined;
+              const scope = { connectionId: connection.id, database, schema };
+              const { objects } = await adapter.listObjects(scope, { pattern: needle, cursor: null });
+              for (const object of objects.slice(0, ATTACHMENT_MATCHES - items.length)) {
+                const details = await adapter.describe({ ...scope, name: object.name });
+                const place = [database, schema, object.name].filter(Boolean).join(".");
+                items.push({ id: `${connection.id}:${place}`, identifier: connection.name, title: place, subtitle: `${info.label}. Goes to the agent's provider.`, url: `datawise://structure/${encodeURIComponent(connection.id)}/${encodeURIComponent(place)}`, text: `Table structure from ${connection.name}:\n${structureText(structureOf(details))}`, resourceType: object.kind });
+              }
+            }).catch((error: unknown) => console.error("Datawise: attachment search failed for one connection:", errorMessage(error)));
+          }
+          return { items };
+        })(),
+      ),
+    ),
+  );
   server.handle(
     rpc.destroyObject,
     guard(async ({ ref, action, confirmName }: RpcInput<typeof rpc.destroyObject>) => {
@@ -190,7 +332,10 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
           const job = jobs.start("query", null, async ({ signal }): Promise<JobOutcome> => {
             const started = Date.now();
             const combined = AbortSignal.any([signal, AbortSignal.timeout(input.timeoutMs)]);
-            const finish = (ok: boolean) => store.addHistory(connection.id, { text: input.text, durationMs: Date.now() - started, ok }).catch(() => undefined);
+            const finish = async (ok: boolean) => {
+              const { keepHistory, historyLength } = await preferences.get();
+              if (keepHistory) await store.addHistory(connection.id, { text: input.text, durationMs: Date.now() - started, ok }, historyLength).catch(() => undefined);
+            };
             try {
               const results: QueryResult[] = await pool.use(connection.id, (live) => live.run(statements, { scope: input.scope, limit: input.limit, timeoutMs: input.timeoutMs, signal: combined, readOnly: connection.safety === "read-only" }));
               await finish(true);
@@ -375,7 +520,8 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
     guard(async ({ name, format }: RpcInput<typeof rpc.defaultExportPath>) => {
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const safeName = name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80) || "export";
-      return { path: join(homedir(), "Downloads", "datawise", `${safeName}-${stamp}.${format}`) };
+      const { exportFolder } = await preferences.get();
+      return { path: join(exportFolder.trim() ? expandPath(exportFolder.trim()) : join(homedir(), "Downloads", "datawise"), `${safeName}-${stamp}.${format}`) };
     }),
   );
 
@@ -411,6 +557,8 @@ export function contributeServer(server: Pick<PluginServerContext, "handle">, fo
   return async () => {
     process.off("uncaughtException", onStray);
     process.off("unhandledRejection", onStray);
+    preferences.close();
+    removeAgentHook?.();
     jobs.cancelAll();
     await pool.closeAll();
   };

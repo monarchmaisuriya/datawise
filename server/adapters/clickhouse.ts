@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
+import { tlsClientOptions } from "../tls";
 import { httpCall, httpOpen, type HttpTarget } from "../http";
 import { SqlAdapter, type SqlCursor, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
 import type { Adapter, AdapterContext } from "./types";
@@ -56,9 +57,7 @@ class ClickhouseDriver implements SqlDriver {
       protocol: connection.tls === "off" ? "http:" : "https:",
       host: endpoint.host,
       port: endpoint.port,
-      servername: endpoint.tlsServername,
-      rejectUnauthorized: connection.tls === "verify",
-      ca: connection.caCertificate || undefined,
+      tls: tlsClientOptions(connection, endpoint),
       headers: { "x-clickhouse-user": connection.user || "default", "x-clickhouse-key": connection.password ?? "" },
     };
   }

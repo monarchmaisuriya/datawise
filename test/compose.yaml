@@ -39,8 +39,40 @@ services:
   ssh:
     image: lscr.io/linuxserver/openssh-server:latest
     mem_limit: 128m
-    environment: { PASSWORD_ACCESS: "true", USER_NAME: dw, USER_PASSWORD: dw-test-pass, DOCKER_MODS: "linuxserver/mods:openssh-server-ssh-tunnel" }
+    environment: { PASSWORD_ACCESS: "true", USER_NAME: dw, USER_PASSWORD: dw-test-pass, PUBLIC_KEY_DIR: /sshkeys, DOCKER_MODS: "linuxserver/mods:openssh-server-ssh-tunnel" }
+    volumes: ["./certs/sshkeys:/sshkeys:ro"]
     ports: ["127.0.0.1:22222:2222"]
+  # TLS only: each of these refuses a connection without encryption. Run scripts/make-test-certs.sh first.
+  postgres-tls:
+    profiles: [tls]
+    image: postgres:17-alpine
+    mem_limit: 256m
+    environment: { POSTGRES_PASSWORD: dw-test-pass, POSTGRES_USER: dw, POSTGRES_DB: dw }
+    volumes: ["./certs:/certs:ro"]
+    entrypoint: ["sh", "-c", "cp /certs/server.crt /certs/server.key /tmp/ && chown postgres /tmp/server.* && chmod 600 /tmp/server.key && printf 'local all all trust\\nhostssl all all all scram-sha-256\\n' > /tmp/hba.conf && chown postgres /tmp/hba.conf && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key -c hba_file=/tmp/hba.conf"]
+    ports: ["127.0.0.1:25433:5432"]
+  mysql-tls:
+    profiles: [tls]
+    image: mysql:8.4
+    mem_limit: 1g
+    environment: { MYSQL_ROOT_PASSWORD: dw-test-pass, MYSQL_DATABASE: dw }
+    volumes: ["./certs:/certs:ro"]
+    command: ["--require-secure-transport=ON", "--ssl-ca=/certs/ca.crt", "--ssl-cert=/certs/server.crt", "--ssl-key=/certs/server.key"]
+    ports: ["127.0.0.1:23308:3306"]
+  redis-tls:
+    profiles: [tls]
+    image: redis:7-alpine
+    mem_limit: 128m
+    volumes: ["./certs:/certs:ro"]
+    command: ["redis-server", "--port", "0", "--tls-port", "6379", "--tls-cert-file", "/certs/server.crt", "--tls-key-file", "/certs/server.key", "--tls-ca-cert-file", "/certs/ca.crt", "--tls-auth-clients", "no", "--requirepass", "dw-test-pass"]
+    ports: ["127.0.0.1:26380:6379"]
+  mongodb-tls:
+    profiles: [tls]
+    image: mongo:8
+    mem_limit: 1g
+    volumes: ["./certs:/certs:ro"]
+    command: ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", "/certs/server.pem", "--tlsCAFile", "/certs/ca.crt", "--tlsAllowConnectionsWithoutCertificates", "--bind_ip_all"]
+    ports: ["127.0.0.1:27019:27017"]
   elasticsearch:
     profiles: [heavy]
     image: docker.elastic.co/elasticsearch/elasticsearch:8.19.3

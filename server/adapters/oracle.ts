@@ -1,7 +1,7 @@
 import type { Connection, Pool } from "oracledb";
 import { loadDriver } from "../drivers";
 import type { ColumnInfo, ObjectDetails, ObjectRef, Scope } from "../../shared/contracts";
-import { ansiQuote, SqlAdapter, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
+import { ansiQuote, groupRows, SqlAdapter, type SqlDialectRules, type SqlDriver, type SqlSession } from "./sql-base";
 import type { Adapter, AdapterContext } from "./types";
 
 const rules: SqlDialectRules = {
@@ -11,6 +11,14 @@ const rules: SqlDialectRules = {
   table: (ref) => `${ref.schema ? `${ansiQuote(ref.schema)}.` : ""}${ansiQuote(ref.name)}`,
   page: (sql, orderBy, limit, offset) => `${sql}${orderBy ? ` ORDER BY ${orderBy}` : ""} OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`,
   asText: (quoted) => `TO_CHAR(${quoted})`,
+  // TO_CHAR with no format uses the session's fixed format, so every digit of a date reaches the grid.
+  projection(columns) {
+    const isDate = (type: string | null) => /^(date|timestamp)/i.test(type ?? "");
+    if (!columns.some((column) => isDate(column.type))) return "*";
+    return columns.map((column) => (isDate(column.type) ? `TO_CHAR(${ansiQuote(column.name)}) AS ${ansiQuote(column.name)}` : ansiQuote(column.name))).join(", ");
+  },
+  // Sorting a date must use the column, not the text alias of the same name.
+  orderColumn: (table, column) => `${table}.${ansiQuote(column)}`,
   emptyInsert: (table) => `INSERT INTO ${table} VALUES (DEFAULT)`,
   bind(value) {
     if (typeof value === "boolean") return value ? 1 : 0;
@@ -19,6 +27,12 @@ const rules: SqlDialectRules = {
   truncate: (table) => `TRUNCATE TABLE ${table}`,
   drop: (table, kind) => (kind === "view" ? `DROP VIEW ${table}` : `DROP TABLE ${table}`),
 };
+
+// The query box cannot rewrite a person's SELECT, so a date there has the driver's millisecond precision.
+function wallClock(value: Date): string {
+  const two = (part: number) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${two(value.getMonth() + 1)}-${two(value.getDate())} ${two(value.getHours())}:${two(value.getMinutes())}:${two(value.getSeconds())}.${String(value.getMilliseconds()).padStart(3, "0")}`;
+}
 
 // A fixed text form for dates, so what the grid shows is what an edit can write back.
 const SESSION_SETUP = "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS' NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF' NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM' NLS_NUMERIC_CHARACTERS = '.,'";
@@ -35,9 +49,10 @@ class OracleDriver implements SqlDriver {
 
   private async library() {
     const oracledb = await loadDriver<typeof import("oracledb")>("oracledb");
-    // Numbers as text keep full precision; a JavaScript number would round large values.
-    // Listing TIMESTAMP covers every date type, and CLOB covers NCLOB.
-    oracledb.fetchAsString = [oracledb.DB_TYPE_NUMBER, oracledb.DB_TYPE_TIMESTAMP, oracledb.DB_TYPE_CLOB] as never;
+    // Numbers as text keep full precision; a JavaScript number would round large values. CLOB covers NCLOB.
+    // Dates are not listed: this driver turns them into JavaScript date text, which drops microseconds and
+    // cannot be written back. Table reads use TO_CHAR instead, in the projection below.
+    oracledb.fetchAsString = [oracledb.DB_TYPE_NUMBER, oracledb.DB_TYPE_CLOB] as never;
     oracledb.fetchAsBuffer = [oracledb.DB_TYPE_BLOB];
     return oracledb;
   }
@@ -72,7 +87,7 @@ class OracleDriver implements SqlDriver {
         return {
           columns,
           affected: null,
-          next: async (count) => (await resultSet.getRows(count)) as unknown[][],
+          next: async (count) => ((await resultSet.getRows(count)) as unknown[][]).map((row) => row.map((value) => (value instanceof Date ? wallClock(value) : value))),
           close: () => resultSet.close(),
         };
       },
@@ -159,13 +174,10 @@ class OracleDriver implements SqlDriver {
     for (const row of constraints) if (row[1] === "U" && row[4] === "ENABLED") uniqueGroups.set(String(row[0]), [...(uniqueGroups.get(String(row[0])) ?? []), String(row[2])]);
     const unique = [...uniqueGroups.values()].find((names) => names.every((name) => nullable.get(name) === false));
     const keyColumns = kind === "table" ? (primary.length > 0 ? primary : (unique ?? [])) : [];
-    const fkGroups = new Map<string, { columns: string[]; table: string }>();
-    for (const row of constraints) {
-      if (row[1] !== "R") continue;
-      const entry = fkGroups.get(String(row[0])) ?? { columns: [], table: String(row[3]) };
-      entry.columns.push(String(row[2]));
-      fkGroups.set(String(row[0]), entry);
-    }
+    const fkRows = await this.rows(
+      "SELECT c.constraint_name, cc.column_name, r.owner, r.table_name, rc.column_name FROM all_constraints c JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name JOIN all_constraints r ON r.owner = c.r_owner AND r.constraint_name = c.r_constraint_name JOIN all_cons_columns rc ON rc.owner = r.owner AND rc.constraint_name = r.constraint_name AND rc.position = cc.position WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R' ORDER BY c.constraint_name, cc.position",
+      [owner, ref.name],
+    );
     const indexes = new Map<string, { name: string; columns: string[]; unique: boolean }>();
     for (const row of indexRows) {
       const entry = indexes.get(String(row[0])) ?? { name: String(row[0]), columns: [], unique: row[2] === "UNIQUE" };
@@ -179,7 +191,7 @@ class OracleDriver implements SqlDriver {
       keyColumns,
       keyReason: keyColumns.length > 0 ? null : kind === "table" ? `${ref.name} has no primary key or usable unique constraint, so its rows cannot be changed one at a time.` : "A view cannot be edited here.",
       indexes: [...indexes.values()],
-      foreignKeys: [...fkGroups.entries()].map(([name, value]) => ({ name, columns: value.columns, references: value.table })),
+      foreignKeys: [...groupRows(fkRows, (row) => String(row[0])).entries()].map(([name, rows]) => ({ name, columns: rows.map((row) => String(row[1])), references: `${String(rows[0]?.[3])} (${rows.map((row) => String(row[4])).join(", ")})`, targetDatabase: null, targetSchema: String(rows[0]?.[2]), targetTable: String(rows[0]?.[3]), targetColumns: rows.map((row) => String(row[4])) })),
       definition: null,
       facts: [{ label: "Owner", value: owner }],
     };

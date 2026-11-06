@@ -1,4 +1,4 @@
-import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
+import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, StagedEdit, WriteOp } from "../../shared/contracts";
 import type { StatementClass } from "../sql-script";
 import type { StoredConnection } from "../store";
 
@@ -44,6 +44,8 @@ export interface Adapter {
   readRow(ref: ObjectRef, key: RowKey): Promise<RowPage>;
   planWrite(ref: ObjectRef, op: WriteOp): Promise<WritePlan>;
   planDestroy(ref: ObjectRef, action: "drop" | "truncate"): Promise<WritePlan>;
+  // Several edits that land together or not at all. Only engines with transactionalEdits have this.
+  planBatch?(ref: ObjectRef, edits: StagedEdit[]): Promise<WritePlan>;
   // Splits text into statements and marks each read or write. Anything not proved a read is a write.
   parse(text: string): Promise<ParsedStatement[]>;
   run(statements: ParsedStatement[], context: RunContext): Promise<QueryResult[]>;

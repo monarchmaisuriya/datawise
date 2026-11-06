@@ -4,6 +4,7 @@ import { loadDriver } from "../drivers";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
 import { finishRows } from "../cells";
 import { errorMessage } from "../errors";
+import { tlsClientOptions } from "../tls";
 import { PartialRunError, STREAM_BATCH } from "./sql-base";
 import type { Adapter, AdapterContext, ParsedStatement, RunContext, StreamBatch, StreamSource, WritePlan } from "./types";
 
@@ -13,6 +14,10 @@ const READ_METHODS = new Set(["find", "findOne", "aggregate", "countDocuments", 
 const WRITE_METHODS = new Set(["insertOne", "insertMany", "updateOne", "updateMany", "replaceOne", "deleteOne", "deleteMany", "createIndex", "dropIndex", "drop", "bulkWrite", "findOneAndUpdate", "findOneAndReplace", "findOneAndDelete"]);
 const DB_READ_METHODS = new Set(["getCollectionNames", "listCollections", "stats", "version"]);
 const DB_WRITE_METHODS = new Set(["createCollection", "dropDatabase", "runCommand"]);
+function withoutRejectFlag({ rejectUnauthorized: _ignored, ...rest }: ReturnType<typeof tlsClientOptions>) {
+  return rest;
+}
+
 const CURSOR_MODIFIERS = new Set(["limit", "skip", "sort", "project", "projection", "toArray", "maxTimeMS", "hint", "collation"]);
 // These aggregation stages write. A pipeline with one anywhere, at any depth, is a write.
 const WRITING_STAGES = new Set(["$out", "$merge"]);
@@ -192,8 +197,9 @@ class MongoAdapter implements Adapter {
         tls: connection.tls !== "off",
         tlsAllowInvalidCertificates: connection.tls === "require",
         tlsAllowInvalidHostnames: connection.tls === "require",
-        servername: connection.tls !== "off" ? endpoint.tlsServername : undefined,
-        ca: connection.caCertificate || undefined,
+        // The same check as every other engine, so a tunnel's address is never what the certificate must name.
+        // rejectUnauthorized stays out: the driver sets it from tlsAllowInvalidCertificates above.
+        ...(connection.tls === "off" ? {} : withoutRejectFlag(tlsClientOptions(connection, endpoint))),
       } as MongoClientOptions;
       const host = endpoint.host.includes(":") ? `[${endpoint.host}]` : endpoint.host;
       const client = new Client(`mongodb://${host}:${endpoint.port}/`, options);

@@ -3,7 +3,7 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { FlatList, Icon, Modal, TextInput } from "@getpaseo/plugin/client/ui";
 import { createContext, type ReactNode, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import { BYTES_TAG, type JobView, rpc, type StartResult } from "../shared/contracts";
+import { BYTES_TAG, type ConnectionColor, type JobView, rpc, type StartResult } from "../shared/contracts";
 
 export type Theme = PluginSurfaceProps["theme"];
 export const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "ui-monospace, Menlo, Consolas, monospace" });
@@ -12,6 +12,7 @@ function buildStyles(theme: Theme, compact: boolean) {
   const c = theme.colors;
   return {
     compact,
+    theme,
     colors: c,
     root: { flex: 1, minHeight: 0, backgroundColor: c.surface0 },
     title: { color: c.foreground, fontSize: 15, fontWeight: "600" as const },
@@ -63,6 +64,7 @@ export function useApi() {
     countRows: useRpc(rpc.countRows),
     readRow: useRpc(rpc.readRow),
     writeRows: useRpc(rpc.writeRows),
+    writeBatch: useRpc(rpc.writeBatch),
     destroyObject: useRpc(rpc.destroyObject),
     runQuery: useRpc(rpc.runQuery),
     listHistory: useRpc(rpc.listHistory),
@@ -77,6 +79,13 @@ export function useApi() {
     exportText: useRpc(rpc.exportText),
     jobStatus: useRpc(rpc.jobStatus),
     cancelJob: useRpc(rpc.cancelJob),
+    getView: useRpc(rpc.getView),
+    saveView: useRpc(rpc.saveView),
+    getPlace: useRpc(rpc.getPlace),
+    savePlace: useRpc(rpc.savePlace),
+    getQueryTabs: useRpc(rpc.getQueryTabs),
+    saveQueryTabs: useRpc(rpc.saveQueryTabs),
+    inspectSqlite: useRpc(rpc.inspectSqlite),
   };
   const latest = useRef(api);
   latest.current = api;
@@ -123,6 +132,12 @@ export function cellText(cell: unknown): string {
     return JSON.stringify(cell);
   }
   return String(cell);
+}
+
+// The palette is theme tokens, so a label stays readable in every theme.
+export function connectionColorValue(colors: Theme["colors"], color: ConnectionColor | null): string | null {
+  if (!color) return null;
+  return { red: colors.statusDanger, amber: colors.statusWarning, green: colors.statusSuccess, gray: colors.foregroundMuted, contrast: colors.foreground }[color];
 }
 
 export function Btn({ label, icon, onPress, kind = "ghost", disabled = false }: { label?: string; icon?: string; onPress: () => void; kind?: "primary" | "ghost" | "danger"; disabled?: boolean }) {

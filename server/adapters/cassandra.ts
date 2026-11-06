@@ -1,5 +1,6 @@
 import type { Client, ClientOptions } from "cassandra-driver";
 import { loadDriver } from "../drivers";
+import { tlsClientOptions } from "../tls";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, WriteOp } from "../../shared/contracts";
 import { finishRows, fromCell } from "../cells";
 import { errorMessage } from "../errors";
@@ -36,7 +37,7 @@ class CassandraAdapter implements Adapter {
         socketOptions: { connectTimeout: 15000 },
         policies: { addressResolution: new StayOnThisHost() as never },
         authProvider: connection.user ? new driver.auth.PlainTextAuthProvider(connection.user, connection.password ?? "") : undefined,
-        sslOptions: connection.tls === "off" ? undefined : ({ rejectUnauthorized: connection.tls === "verify", ca: connection.caCertificate || undefined, servername: endpoint.tlsServername } as never),
+        sslOptions: connection.tls === "off" ? undefined : (tlsClientOptions(connection, endpoint) as never),
       };
       const client = new driver.Client(options);
       await client.connect();

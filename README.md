@@ -4,9 +4,9 @@
 
 A database client for [Paseo](https://paseo.sh): browse, query, edit, import and export data from PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j. See [OVERVIEW.md](OVERVIEW.md) for what it does and its limits.
 
-Current release: **v0.1.1**. Datawise follows [Semantic Versioning](https://semver.org/); while it is below 1.0.0, a minor release may include breaking changes. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.2.0**. Datawise follows [Semantic Versioning](https://semver.org/); while it is below 1.0.0, a minor release may include breaking changes. See [CHANGELOG.md](CHANGELOG.md).
 
-Requires Paseo 0.15 or later, and `npm` on the daemon machine's `PATH`.
+Requires Paseo 0.15.1 or later, and `npm` on the daemon machine's `PATH`.
 
 ![The data view, showing a table of sample customers](assets/data.jpg)
 
@@ -15,7 +15,7 @@ Requires Paseo 0.15 or later, and `npm` on the daemon machine's `PATH`.
 ## Install
 
 ```bash
-paseo plugin install git:https://github.com/monarchmaisuriya/datawise.git --ref v0.1.1
+paseo plugin install git:https://github.com/monarchmaisuriya/datawise.git --ref v0.2.0
 ```
 
 To move to a later release, pick a tag from the [releases page](https://github.com/monarchmaisuriya/datawise/releases) and put it in place of `<tag>`:
@@ -60,7 +60,11 @@ docker compose -f test/compose.yaml --profile heavy up -d oracle
 ./scripts/conformance.sh oracle
 ```
 
-Heavy spec names: `oracle`, `mssql`, `elasticsearch`, `opensearch`, `cassandra`, `neo4j`. Remove everything with:
+Heavy spec names: `oracle`, `mssql`, `elasticsearch`, `opensearch`, `cassandra`, `neo4j`.
+
+Other specs: `settings` (preferences, labels, views and saved state), `features-<sqlite|postgres|mysql|mariadb|mssql|oracle>` (foreign keys, pending edits, agent tool, attachments), `agent-clickhouse`, `agent-cassandra`, `readonly-folder`, `ssh-keys` and `tls`. Run `./scripts/make-test-certs.sh` before starting the `tls` profile.
+
+Remove everything with:
 
 ```bash
 docker compose -f test/compose.yaml --profile heavy down -v
