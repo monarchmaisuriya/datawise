@@ -1,4 +1,8 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { agentRowAccessRefusal, agentRowLevel } from "./agent-access";
+import { visibleText, visibleValue } from "./agent-display";
 import { jumpFilters } from "./foreign-keys";
 import { toMarkdownTable } from "./markdown";
 import { stageCell, stageDelete, toEdits } from "./staging";
@@ -65,5 +69,62 @@ describe("markdown tables", () => {
   });
   it("escapes pipes and new lines and honours column order", () => {
     expect(toMarkdownTable(["a", "b"], [["x|y", "1\n2"]], [1, 0])).toBe("| b | a |\n| --- | --- |\n| 1<br>2 | x\\|y |");
+  });
+});
+
+describe("values on the approval screen", () => {
+  it("shows a line break as a code, so a value cannot look like another change", () => {
+    expect(visibleValue("a\nDELETE FROM users")).toBe('"a\\nDELETE FROM users"');
+  });
+  it("keeps apart values that would otherwise look the same", () => {
+    expect(visibleValue(null)).toBe("NULL");
+    expect(visibleValue("NULL")).toBe('"NULL"');
+    expect(visibleValue(1)).toBe("1");
+    expect(visibleValue("1")).toBe('"1"');
+    expect(visibleValue("admin ")).toBe('"admin "');
+    expect(visibleValue("a\\nb")).not.toBe(visibleValue("a\nb"));
+  });
+  it("shows characters that hide as codes", () => {
+    expect(visibleValue("safe‮gnp.exe​")).toBe('"safe\\u{202e}gnp.exe\\u{200b}"');
+    expect(visibleValue("a bㅤc️")).toBe('"a\\u{a0}b\\u{3164}c\\u{fe0f}"');
+    expect(visibleText("x\u{e0041}y")).toBe("x\\u{e0041}y");
+  });
+  it("draws bytes as a size and a start", () => {
+    expect(visibleValue({ "$datawise.bytes": "UExBTlRFREJZVEVT" })).toBe("<12 bytes, starting UExBTlRFREJZVEVT>");
+  });
+});
+
+describe("agent access to rows", () => {
+  const base = { engine: "postgres" as const, environment: "development" as const, safety: "confirm" as const, agentAccess: "schema" as const, agentRowAccess: "propose" as const };
+  it("allows a labelled connection", () => {
+    expect(agentRowAccessRefusal(base)).toBeNull();
+    expect(agentRowLevel(base)).toBe("propose");
+  });
+  it("refuses production and no label", () => {
+    expect(agentRowAccessRefusal({ ...base, environment: "production" })).toMatch(/development or staging/);
+    expect(agentRowAccessRefusal({ ...base, environment: "none" })).toMatch(/development or staging/);
+    expect(agentRowLevel({ ...base, environment: "production" })).toBe("none");
+  });
+  it("refuses an engine without transactions across rows", () => {
+    expect(agentRowAccessRefusal({ ...base, engine: "clickhouse" })).toMatch(/does not support/);
+    expect(agentRowLevel({ ...base, engine: "mongodb" })).toBe("none");
+  });
+  it("needs names shared first", () => {
+    expect(agentRowAccessRefusal({ ...base, agentAccess: "none" })).toMatch(/Share table and column names/);
+  });
+  it("gives a read-only connection reads, never proposals", () => {
+    expect(agentRowAccessRefusal({ ...base, safety: "read-only" })).toMatch(/read-only/);
+    expect(agentRowLevel({ ...base, safety: "read-only" })).toBe("read");
+  });
+});
+
+describe("dialogs", () => {
+  it("all go through the wrapper that restores our contexts, or a phone crashes when one opens", () => {
+    const folder = join(__dirname, "..", "client");
+    const offenders = readdirSync(folder).filter((file) => {
+      const source = readFileSync(join(folder, file), "utf8");
+      return file !== "kit.tsx" && /import \{[^}]*\bModal\b[^}]*\} from "@getpaseo\/plugin\/client\/ui"/.test(source);
+    });
+    expect(offenders).toEqual([]);
   });
 });

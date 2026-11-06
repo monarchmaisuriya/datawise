@@ -1,10 +1,10 @@
-import { Icon, Modal, ScrollView } from "@getpaseo/plugin/client/ui";
+import { Icon, ScrollView } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useState } from "react";
 import { Text, View } from "react-native";
 import type { ConnectionView, ObjectRef } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
-import { Btn, errorText, Field, Message, useApi, useGuardedRun, useUi } from "./kit";
+import { Btn, errorText, Field, Message, Modal, useApi, useGuardedRun, useUi } from "./kit";
 
 export function StructureTab({ connection, refObject, onDropped }: { connection: ConnectionView; refObject: ObjectRef; onDropped: () => void }) {
   const ui = useUi();

@@ -6,6 +6,20 @@ import { type Adapter, type ParsedStatement, requireKey, type RunContext, type S
 
 export const STREAM_BATCH = 1000;
 
+// A refusal whose message is safe to show an agent: it names only what the caller already sent.
+export class PlanRefused extends Error {}
+
+// The database did not confirm a commit, so the write may or may not have landed. Never "it failed".
+export class CommitUnknown extends Error {}
+
+async function commitOrUnknown(session: SqlSession): Promise<void> {
+  try {
+    await session.commit();
+  } catch (error) {
+    throw new CommitUnknown(`The database did not confirm the commit, so this may or may not have landed: ${errorMessage(error)}`);
+  }
+}
+
 // An open statement. For a statement with no result set, columns is empty and affected is set.
 export interface SqlCursor {
   columns: ColumnInfo[];
@@ -118,7 +132,9 @@ function orderClause(rules: SqlDialectRules, table: string, sort: Sort | null, d
   const name = (column: string) => rules.orderColumn?.(table, column) ?? rules.quote(column);
   if (sort) {
     if (!details.columns.some((column) => column.name === sort.column)) throw new Error(`Unknown column: ${sort.column}`);
-    return `${name(sort.column)} ${sort.descending ? "DESC" : "ASC"}`;
+    // The key breaks ties. Without it, paging through equal values can skip or repeat rows.
+    const ties = details.keyColumns.filter((column) => column !== sort.column).map(name);
+    return [`${name(sort.column)} ${sort.descending ? "DESC" : "ASC"}`, ...ties].join(", ");
   }
   return details.keyColumns.map(name).join(", ");
 }
@@ -214,7 +230,8 @@ export class SqlAdapter implements Adapter {
       throw error;
     } finally {
       clearTimeout(timer);
-      await session.close();
+      // The work is already done or already failed. A failed close must not change that answer.
+      await session.close().catch(() => undefined);
     }
   }
 
@@ -246,6 +263,49 @@ export class SqlAdapter implements Adapter {
       // After a cut for size, the next page starts at the first row left out, so nothing is skipped.
       nextCursor: result.rows.length > query.limit || cutForSize ? String(offset + finished.rows.length) : null,
     };
+  }
+
+  // For a reader that must not change anything, even by calling a function through a view. Its own
+  // session in a read-only transaction where the engine has one, and always rolled back.
+  private async isolated<T>(ref: ObjectRef, work: (session: SqlSession) => Promise<T>): Promise<T> {
+    const session = await this.driver.dedicated(ref, true);
+    const timer = setTimeout(() => void session.cancel().catch(() => undefined), READ_DEADLINE_MS);
+    try {
+      await session.begin(true);
+      const result = await work(session);
+      await session.rollback();
+      return result;
+    } finally {
+      clearTimeout(timer);
+      await session.close().catch(() => undefined);
+    }
+  }
+
+  async readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    const details = await this.describe(ref);
+    const where = buildWhere(this.rules, query.filters, details.columns);
+    const offset = parseOffset(query.cursor);
+    const sql = this.rules.page(`SELECT ${this.projection(details)} FROM ${this.rules.table(ref)}${where.sql}`, orderClause(this.rules, this.rules.table(ref), query.sort, details), query.limit + 1, offset);
+    const result = await this.isolated(ref, (session) => this.fetch(session, sql, where.params, query.limit + 1));
+    const finished = finishRows(result.rows, query.limit, cellLimit, true);
+    const cutForSize = finished.rows.length < Math.min(result.rows.length, query.limit);
+    return {
+      columns: mergeColumns(result.columns, details),
+      keyColumns: details.keyColumns,
+      keyReason: details.keyReason,
+      rows: finished.rows,
+      cutCells: finished.cutCells,
+      truncated: cutForSize,
+      nextCursor: result.rows.length > query.limit || cutForSize ? String(offset + finished.rows.length) : null,
+    };
+  }
+
+  async readRowIsolated(ref: ObjectRef, key: RowKey): Promise<RowPage> {
+    const details = await this.describe(ref);
+    const where = this.keyWhere(details, ref, key, 1);
+    const result = await this.isolated(ref, (session) => this.fetch(session, `SELECT ${this.projection(details)} FROM ${this.rules.table(ref)} WHERE ${where.sql}`, where.params, 2));
+    const finished = finishRows(result.rows, null, Number.MAX_SAFE_INTEGER);
+    return { columns: mergeColumns(result.columns, details), keyColumns: details.keyColumns, keyReason: details.keyReason, rows: finished.rows, cutCells: [], truncated: false, nextCursor: null };
   }
 
   async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
@@ -298,13 +358,7 @@ export class SqlAdapter implements Adapter {
       );
 
     if (op.kind === "insert") {
-      const names = Object.keys(op.values);
-      this.checkColumns(details, names);
-      const values = names.map((name) => bindValue(name, op.values[name]));
-      const inline = this.rules.inlineParams === true;
-      const placeholder = (value: unknown, index: number) => (inline ? (this.rules.literal?.(value) ?? "NULL") : this.rules.placeholder(index + 1));
-      const sql = names.length === 0 ? this.rules.emptyInsert(table) : `INSERT INTO ${table} (${names.map((name) => this.rules.quote(name)).join(", ")}) VALUES (${values.map(placeholder).join(", ")})`;
-      const preview = names.length === 0 ? sql : `INSERT INTO ${table} (${names.map((name) => this.rules.quote(name)).join(", ")}) VALUES (${values.map(renderLiteral).join(", ")})`;
+      const { sql, values, inline, preview } = this.insertStatement(details, ref, op.values);
       return { preview, run: () => this.writeInTransaction(ref, [{ sql, params: inline ? [] : values, expected: null }]) };
     }
 
@@ -333,6 +387,33 @@ export class SqlAdapter implements Adapter {
     return { preview: shown.join("\n"), run: () => this.writeInTransaction(ref, statements) };
   }
 
+  private insertStatement(details: ObjectDetails, ref: ObjectRef, row: Record<string, unknown>) {
+    const table = this.rules.table(ref);
+    const names = Object.keys(row);
+    this.checkColumns(details, names);
+    const values = names.map((name) =>
+      this.rules.bind(
+        fromCell(row[name]),
+        details.columns.find((column) => column.name === name),
+      ),
+    );
+    const inline = this.rules.inlineParams === true;
+    const placeholder = (value: unknown, index: number) => (inline ? (this.rules.literal?.(value) ?? "NULL") : this.rules.placeholder(index + 1));
+    const sql = names.length === 0 ? this.rules.emptyInsert(table) : `INSERT INTO ${table} (${names.map((name) => this.rules.quote(name)).join(", ")}) VALUES (${values.map(placeholder).join(", ")})`;
+    const preview = names.length === 0 ? sql : `INSERT INTO ${table} (${names.map((name) => this.rules.quote(name)).join(", ")}) VALUES (${values.map(renderLiteral).join(", ")})`;
+    return { sql, values, inline, preview };
+  }
+
+  // Several inserts that land together or not at all.
+  async planInserts(ref: ObjectRef, rows: Record<string, unknown>[]): Promise<WritePlan> {
+    if (!this.driver.transactional) throw new PlanRefused("This engine cannot commit several writes as one.");
+    const details = await this.describe(ref);
+    const blocker = this.rules.batchBlocker?.(details);
+    if (blocker) throw new PlanRefused(blocker);
+    const statements = rows.map((row) => this.insertStatement(details, ref, row));
+    return { preview: statements.map((item) => item.preview).join("\n"), run: () => this.writeInTransaction(ref, statements.map((item) => ({ sql: item.sql, params: item.inline ? [] : item.values, expected: null }))) };
+  }
+
   // All of a write lands or none of it does. A key that matches other than one row undoes the write,
   // so a stale or wrong key can never change a different number of rows than the user saw.
   private async writeInTransaction(ref: ObjectRef, statements: { sql: string; params: unknown[]; expected: number | null }[]): Promise<number> {
@@ -346,7 +427,7 @@ export class SqlAdapter implements Adapter {
           if (statement.expected !== null && count !== statement.expected) throw new Error(count === 0 ? "No row matched its key. Someone may have changed or deleted it; refresh and try again." : `Expected to change ${statement.expected} row, but the key matched ${count}. Nothing was changed.`);
           affected += count;
         }
-        await session.commit();
+        await commitOrUnknown(session);
         return affected;
       } catch (error) {
         await session.rollback().catch(() => undefined);
@@ -356,11 +437,11 @@ export class SqlAdapter implements Adapter {
   }
 
   async planBatch(ref: ObjectRef, edits: StagedEdit[]): Promise<WritePlan> {
-    if (!this.driver.transactional) throw new Error("This engine cannot commit several edits as one.");
+    if (!this.driver.transactional) throw new PlanRefused("This engine cannot commit several edits as one.");
     const details = await this.describe(ref);
     requireKey(ref, details.keyColumns, details.keyReason);
     const blocker = this.rules.batchBlocker?.(details);
-    if (blocker) throw new Error(blocker);
+    if (blocker) throw new PlanRefused(blocker);
     const table = this.rules.table(ref);
     const seen = new Set<string>();
     const shown: string[] = [];
@@ -368,7 +449,7 @@ export class SqlAdapter implements Adapter {
       // One operation per row. With two, a later key could name a row an earlier edit moved, and every
       // row count would still look right while the wrong row changed.
       const id = JSON.stringify(details.keyColumns.map((name) => edit.key[name]));
-      if (seen.has(id)) throw new Error(`Two edits name the same row: ${id}. Nothing was changed.`);
+      if (seen.has(id)) throw new PlanRefused(`Two edits name the same row: ${id}. Nothing was changed.`);
       seen.add(id);
       const read = this.keyWhere(details, ref, edit.key, 1);
       const readSql = `SELECT ${this.projection(details)} FROM ${table} WHERE ${read.sql}`;
@@ -418,7 +499,7 @@ export class SqlAdapter implements Adapter {
                 if ((result.affected ?? 0) !== 1) throw new Error(`The edit to ${step.label} matched ${result.affected ?? 0} rows. Nothing was changed.`);
                 affected += 1;
               }
-              await session.commit();
+              await commitOrUnknown(session);
               return affected;
             } catch (error) {
               await session.rollback().catch(() => undefined);

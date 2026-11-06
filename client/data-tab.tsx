@@ -1,4 +1,4 @@
-import { copyText, Modal, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Text, View } from "react-native";
@@ -10,7 +10,7 @@ import { rowId, toEdits } from "../shared/staging";
 import { parseEdited } from "../shared/values";
 import { dropMissingColumns, visiblePositions } from "../shared/view-columns";
 import { Grid } from "./grid";
-import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Select, useApi, useConfirm, useGuardedRun, useUi, waitForJob } from "./kit";
+import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, Select, useApi, useConfirm, useGuardedRun, useUi, waitForJob } from "./kit";
 import { usePending } from "./pending";
 import { usePreferences } from "./preferences";
 import { RowForm, type RowFormMode } from "./row-form";

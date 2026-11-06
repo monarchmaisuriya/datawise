@@ -46,6 +46,10 @@ export interface Adapter {
   planDestroy(ref: ObjectRef, action: "drop" | "truncate"): Promise<WritePlan>;
   // Several edits that land together or not at all. Only engines with transactionalEdits have this.
   planBatch?(ref: ObjectRef, edits: StagedEdit[]): Promise<WritePlan>;
+  planInserts?(ref: ObjectRef, rows: Record<string, unknown>[]): Promise<WritePlan>;
+  // A read that cannot change anything, for callers that are not a person at the keyboard.
+  readIsolated?(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage>;
+  readRowIsolated?(ref: ObjectRef, key: RowKey): Promise<RowPage>;
   // Splits text into statements and marks each read or write. Anything not proved a read is a write.
   parse(text: string): Promise<ParsedStatement[]>;
   run(statements: ParsedStatement[], context: RunContext): Promise<QueryResult[]>;

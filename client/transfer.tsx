@@ -1,9 +1,9 @@
-import { copyText, Modal, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import type { ConnectionView, ExportFormat, ExportSource, ImportFormat, JobView, ObjectRef } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
-import { Btn, cellText, Chip, errorText, Field, Message, Select, useApi, useGuardedRun, useUi, waitForJob } from "./kit";
+import { Btn, cellText, Chip, errorText, Field, Message, Modal, Select, useApi, useGuardedRun, useUi, waitForJob } from "./kit";
 import { usePreferences } from "./preferences";
 
 const EXPORT_FORMATS: { value: ExportFormat; label: string }[] = [

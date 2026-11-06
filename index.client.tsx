@@ -1,12 +1,18 @@
-import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import { type PluginClientContext, type PluginSidebarItemProps, useRpc } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { useQuery } from "@tanstack/react-query";
+import { Text } from "react-native";
 import { DatawiseApp } from "./client/app";
 import { SqlFilePanel, SqliteFilePanel } from "./client/file-panels";
 import { SettingsScreen } from "./client/settings-screen";
-import { structureAttachment } from "./shared/contracts";
+import { rpc, structureAttachment } from "./shared/contracts";
 
-function SidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
-  return <SidebarRow icon="Database" active={currentScreen?.screenId === "main"} onPress={() => openScreen({ screenId: "main" })} />;
+function SidebarItem({ currentScreen, openScreen, theme }: PluginSidebarItemProps) {
+  const listRequests = useRpc(rpc.listAgentRequests);
+  // Slower than inside Datawise, because this runs all the time. A request can otherwise wait unseen.
+  const requests = useQuery({ queryKey: ["datawise", "agent-requests", "sidebar"], queryFn: () => listRequests({}), refetchInterval: 15000, retry: false });
+  const waiting = (requests.data?.requests ?? []).filter((request) => request.status === "pending").length;
+  return <SidebarRow icon="Database" active={currentScreen?.screenId === "main"} onPress={() => openScreen({ screenId: "main" })} trailing={waiting > 0 ? <Text style={{ color: theme.colors.statusWarning, fontSize: 12, fontWeight: "600", paddingRight: 8 }}>{waiting}</Text> : undefined} />;
 }
 
 export default function contribute(client: PluginClientContext) {

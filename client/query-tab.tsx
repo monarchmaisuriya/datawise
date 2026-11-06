@@ -1,4 +1,4 @@
-import { copyText, FlatList, Modal, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, FlatList, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
@@ -7,7 +7,7 @@ import { ENGINES } from "../shared/engines";
 import { toMarkdownTable } from "../shared/markdown";
 import { QUERY_LIMITS, TIME_LIMITS_MS } from "../shared/preferences";
 import { Grid } from "./grid";
-import { Btn, Chip, errorText, Field, Message, Select, useApi, useConfirm, useGuardedRun, useUi } from "./kit";
+import { Btn, Chip, errorText, Field, Message, Modal, Select, useApi, useConfirm, useGuardedRun, useUi } from "./kit";
 import { usePreferences } from "./preferences";
 import { type EditorControl, SqlEditor } from "./sql-editor";
 import { ExportModal } from "./transfer";

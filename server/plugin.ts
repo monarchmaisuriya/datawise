@@ -5,10 +5,13 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { inferValue } from "../shared/values";
 import { open as openFile } from "node:fs/promises";
-import { type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult } from "../shared/contracts";
+import { agentActivityEvent, type AgentActivityEvent, type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import type { Adapter, StreamSource, WritePlan } from "./adapters/types";
-import { createDescribeTool, agentMayRead } from "./agent-tool";
+import { agentRowLevel } from "../shared/agent-access";
+import { AgentRequests } from "./agent-requests";
+import { type ActivityLog, agentMayRead, agentTarget, createAgentTools } from "./agent-tool";
+import { CommitUnknown } from "./adapters/sql-base";
 import { dataFolder } from "./paseo-home";
 import { errorMessage, guard } from "./errors";
 import { exporterFor, openOutput, readRecords, sqlTextFor, writeChunk } from "./formats";
@@ -71,6 +74,7 @@ function sourceName(source: ExportSource): string {
 const onStray = (error: unknown) => console.error("Datawise: stray driver error:", errorMessage(error));
 
 const ATTACHMENT_MATCHES = 10;
+const ACTIVITY_LIMIT = 500;
 const EMPTY_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [] };
 
 function viewKey(ref: ObjectRef): string {
@@ -96,11 +100,23 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   // A save still on its way when a connection is deleted must not bring back what the delete removed.
   const connectionExists = async (id: string) => (await store.listConnections()).some((item) => item.id === id);
 
-  const describeTool = createDescribeTool(store, pool);
+  // A record of what agents did, with no values, because reads run without asking.
+  const activity = new SideFile(findFolder, "agent-activity.json", z.object({ events: z.array(agentActivityEvent) }), () => ({ events: [] }));
+  const record = (event: Omit<AgentActivityEvent, "at">) => {
+    void activity
+      .update((state) => {
+        state.events.unshift({ ...event, agentTitle: event.agentTitle?.slice(0, 120) ?? null, at: new Date().toISOString() });
+        state.events.length = Math.min(state.events.length, ACTIVITY_LIMIT);
+      })
+      .catch(onStray);
+  };
+  const requests = new AgentRequests((request) => record({ agentId: request.agentId, agentTitle: request.agentTitle, connectionId: request.connectionId, connectionName: request.connectionName, action: "expired", place: request.place, rows: request.rows }));
+  const logAgent: ActivityLog = ({ connection, ...event }) => record({ ...event, connectionId: connection.id, connectionName: connection.name });
+  const agentTools = createAgentTools(store, pool, requests, logAgent);
   let removeAgentHook: (() => void) | null = null;
   const syncAgentHook = async () => {
     const wanted = (await store.listConnections()).some(agentMayRead);
-    if (wanted && !removeAgentHook) removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, describeTool] }));
+    if (wanted && !removeAgentHook) removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, ...agentTools] }));
     if (!wanted && removeAgentHook) {
       removeAgentHook();
       removeAgentHook = null;
@@ -135,6 +151,8 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
     rpc.saveConnection,
     guard(async (input: RpcInput<typeof rpc.saveConnection>) => {
       const saved = await store.saveConnection(input);
+      // A save can point this at another server, so nothing approved later may land on it.
+      requests.expireConnection(saved.id, "The connection was changed.");
       // The next request connects with the new settings.
       await pool.disconnect(saved.id);
       await syncAgentHook();
@@ -144,9 +162,13 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   server.handle(
     rpc.deleteConnection,
     guard(async ({ id }: { id: string }) => {
+      requests.expireConnection(id, "The connection was deleted.");
       await pool.disconnect(id);
       await store.deleteConnection(id);
       await syncAgentHook();
+      await activity.update((state) => {
+        state.events = state.events.filter((event) => event.connectionId !== id);
+      });
       const prefix = JSON.stringify([id]).slice(0, -1);
       await views.update((state) => {
         for (const key of Object.keys(state.views)) if (key.startsWith(prefix)) delete state.views[key];
@@ -206,6 +228,61 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
     ),
   );
   server.handle(rpc.writeBatch, guard(async (input: RpcInput<typeof rpc.writeBatch>) => withStartDeadline((stillWanted) => startBatch(input.ref, input, stillWanted))));
+  server.handle(rpc.listAgentRequests, guard(async () => ({ requests: requests.list() })));
+  server.handle(
+    rpc.getAgentRequest,
+    guard(async ({ id }: { id: string }) => {
+      const request = requests.get(id);
+      return { request: requests.summaryOf(request), items: request.items };
+    }),
+  );
+  server.handle(
+    rpc.decideAgentRequest,
+    guard(async ({ id, approve }: RpcInput<typeof rpc.decideAgentRequest>) => {
+      const event = (action: AgentActivityEvent["action"], item: { agentId: string; agentTitle: string | null; connectionId: string; connectionName: string; place: string; rows: number }) => record({ agentId: item.agentId, agentTitle: item.agentTitle, connectionId: item.connectionId, connectionName: item.connectionName, action, place: item.place, rows: item.rows });
+      if (!approve) {
+        const rejected = requests.reject(id);
+        event("rejected", rejected);
+        return requests.summaryOf(rejected);
+      }
+      // Flipped first, so a second press cannot run it. Everything slow happens in the job, past the RPC limit.
+      const request = requests.take(id);
+      event("approved", request);
+      jobs.start("write", null, async () => {
+        try {
+          const affected = await pool.use(request.connectionId, async (adapter, connection) => {
+            // Asked again now, because the answer may have changed while this waited.
+            if (agentRowLevel(connection) !== "propose") throw new Error("This connection no longer takes proposed changes.");
+            if (agentTarget(connection) !== request.target) throw new Error("This connection now points somewhere else, so this was not run.");
+            gate({ mode: connection.safety === "read-only" ? "read-only" : "open", writes: true, confirmed: true, preview: `Write to ${request.place}` });
+            if (request.inserts && adapter.planInserts) return (await adapter.planInserts(request.ref, request.inserts)).run();
+            if (request.edits && adapter.planBatch) return (await adapter.planBatch(request.ref, request.edits)).run();
+            throw new Error("This engine cannot commit several writes as one.");
+          });
+          request.status = "done";
+          request.affected = affected;
+          event("done", request);
+          return { affected };
+        } catch (error) {
+          request.status = error instanceof CommitUnknown ? "unknown" : "failed";
+          request.message = errorMessage(error);
+          event("failed", request);
+          throw error;
+        }
+      });
+      return requests.summaryOf(request);
+    }),
+  );
+  server.handle(rpc.listAgentActivity, guard(async () => ({ events: (await activity.read()).events })));
+  server.handle(
+    rpc.clearAgentActivity,
+    guard(async () => {
+      await activity.update((state) => {
+        state.events = [];
+      });
+      return { ok: true as const };
+    }),
+  );
   server.handle(rpc.getView, guard(async (ref: ObjectRef) => (await views.read()).views[viewKey(ref)] ?? EMPTY_VIEW));
   server.handle(
     rpc.saveView,

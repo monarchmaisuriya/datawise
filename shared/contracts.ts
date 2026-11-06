@@ -16,6 +16,10 @@ export const connectionColor = z.enum(["red", "amber", "green", "gray", "contras
 export type ConnectionColor = z.infer<typeof connectionColor>;
 export const agentAccess = z.enum(["none", "schema"]);
 export type AgentAccess = z.infer<typeof agentAccess>;
+// A separate field, not more agentAccess values: an older Datawise strips an unknown field and falls back to
+// names only, but would refuse the whole file on an unknown value.
+export const agentRowAccess = z.enum(["none", "read", "propose"]);
+export type AgentRowAccess = z.infer<typeof agentRowAccess>;
 
 // A secret in a save request: missing keeps the stored value, null clears it, a string replaces it.
 const secretChange = z.string().nullable().optional();
@@ -49,6 +53,7 @@ export const connectionInput = z.object({
   color: connectionColor.nullable().default(null),
   group: z.string().trim().max(60).default(""),
   agentAccess: agentAccess.default("none"),
+  agentRowAccess: agentRowAccess.default("none"),
   ssh: sshInput.nullable().default(null),
   // False keeps the password in memory only, so it is asked for again after Paseo restarts.
   rememberPassword: z.boolean().default(true),
@@ -83,6 +88,7 @@ export const connectionView = z.object({
   color: connectionColor.nullable(),
   group: z.string(),
   agentAccess,
+  agentRowAccess,
   ssh: sshInput.nullable(),
   sshHostFingerprint: z.string().nullable(),
   rememberPassword: z.boolean(),
@@ -225,6 +231,42 @@ export const queryTabRecord = z.object({ id: z.string(), name: z.string().max(60
 export type QueryTabRecord = z.infer<typeof queryTabRecord>;
 export const queryTabs = z.object({ activeId: z.string(), tabs: z.array(queryTabRecord).max(30) });
 export type QueryTabs = z.infer<typeof queryTabs>;
+
+export const agentRequestItem = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("insert"), values: z.record(z.string(), z.unknown()) }),
+  z.object({ kind: z.literal("update"), key: rowKey, changes: z.array(z.object({ column: z.string(), before: z.unknown(), after: z.unknown() })) }),
+  z.object({ kind: z.literal("delete"), key: rowKey, row: z.record(z.string(), z.unknown()) }),
+]);
+export type AgentRequestItem = z.infer<typeof agentRequestItem>;
+
+export const agentRequestSummary = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  agentTitle: z.string().nullable(),
+  connectionId: z.string(),
+  connectionName: z.string(),
+  environment: environmentLabel,
+  place: z.string(),
+  rows: z.number(),
+  status: z.enum(["pending", "running", "done", "failed", "unknown", "rejected", "expired"]),
+  message: z.string().nullable(),
+  affected: z.number().nullable(),
+  createdAt: z.string(),
+  expiresAt: z.string(),
+});
+export type AgentRequestSummary = z.infer<typeof agentRequestSummary>;
+
+export const agentActivityEvent = z.object({
+  at: z.string(),
+  agentId: z.string(),
+  agentTitle: z.string().nullable(),
+  connectionId: z.string(),
+  connectionName: z.string(),
+  action: z.enum(["read", "proposed", "approved", "rejected", "expired", "done", "failed"]),
+  place: z.string(),
+  rows: z.number(),
+});
+export type AgentActivityEvent = z.infer<typeof agentActivityEvent>;
 
 export const queryResult = z.object({
   statement: z.string(),
@@ -392,6 +434,11 @@ export const rpc = {
     input: z.object({ source: exportSource, format: exportFormat }),
     output: jobView,
   }),
+  listAgentRequests: defineRpc({ name: "agent-requests.list", input: z.object({}), output: z.object({ requests: z.array(agentRequestSummary) }) }),
+  getAgentRequest: defineRpc({ name: "agent-requests.get", input: z.object({ id: z.string() }), output: z.object({ request: agentRequestSummary, items: z.array(agentRequestItem) }) }),
+  decideAgentRequest: defineRpc({ name: "agent-requests.decide", input: z.object({ id: z.string(), approve: z.boolean() }), output: agentRequestSummary }),
+  listAgentActivity: defineRpc({ name: "agent-activity.list", input: z.object({}), output: z.object({ events: z.array(agentActivityEvent) }) }),
+  clearAgentActivity: defineRpc({ name: "agent-activity.clear", input: z.object({}), output: ok }),
   getView: defineRpc({ name: "views.get", input: objectRef, output: savedView }),
   saveView: defineRpc({ name: "views.save", input: z.object({ ref: objectRef, view: savedView }), output: ok }),
   getPlace: defineRpc({ name: "workspace.place.get", input: z.object({ surface: z.string() }), output: z.object({ place: savedPlace.nullable() }) }),

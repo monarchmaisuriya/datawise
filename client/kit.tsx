@@ -1,8 +1,10 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { FlatList, Icon, Modal, TextInput } from "@getpaseo/plugin/client/ui";
+import { FlatList, Icon, Modal as HostModal, type ModalContentProps, type ModalProps, TextInput } from "@getpaseo/plugin/client/ui";
 import { createContext, type ReactNode, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
+import { PendingContext } from "./pending";
+import { PreferencesContext } from "./preferences";
 import { BYTES_TAG, type ConnectionColor, type JobView, rpc, type StartResult } from "../shared/contracts";
 
 export type Theme = PluginSurfaceProps["theme"];
@@ -86,6 +88,11 @@ export function useApi() {
     getQueryTabs: useRpc(rpc.getQueryTabs),
     saveQueryTabs: useRpc(rpc.saveQueryTabs),
     inspectSqlite: useRpc(rpc.inspectSqlite),
+    listAgentRequests: useRpc(rpc.listAgentRequests),
+    getAgentRequest: useRpc(rpc.getAgentRequest),
+    decideAgentRequest: useRpc(rpc.decideAgentRequest),
+    listAgentActivity: useRpc(rpc.listAgentActivity),
+    clearAgentActivity: useRpc(rpc.clearAgentActivity),
   };
   const latest = useRef(api);
   latest.current = api;
@@ -257,6 +264,28 @@ export function Select({ label, value, options, onChange, placeholder = "Choose"
     </>
   );
 }
+
+// The only dialog to use here. At phone width the host draws Modal.Content in a separate layer and restores only
+// its own contexts, so anything of ours used inside would throw and take the whole app down.
+function BridgedContent({ children, ...props }: ModalContentProps) {
+  const ui = useContext(UiContext);
+  const confirm = useContext(ConfirmContext);
+  const preferences = useContext(PreferencesContext);
+  const pending = useContext(PendingContext);
+  return (
+    <HostModal.Content {...props}>
+      <UiContext.Provider value={ui}>
+        <ConfirmContext.Provider value={confirm}>
+          <PreferencesContext.Provider value={preferences}>
+            <PendingContext.Provider value={pending}>{children}</PendingContext.Provider>
+          </PreferencesContext.Provider>
+        </ConfirmContext.Provider>
+      </UiContext.Provider>
+    </HostModal.Content>
+  );
+}
+
+export const Modal = Object.assign((props: ModalProps) => <HostModal {...props} />, { Content: BridgedContent });
 
 interface ConfirmRequest {
   title: string;

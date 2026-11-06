@@ -1,4 +1,4 @@
-import { copyText, Modal, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
@@ -6,7 +6,7 @@ import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowK
 import { ENGINES } from "../shared/engines";
 import { jumpFilters } from "../shared/foreign-keys";
 import { parseEdited } from "../shared/values";
-import { Btn, cellText, Chip, errorText, Field, isBytes, Message, useApi, useGuardedRun, useUi } from "./kit";
+import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, useApi, useGuardedRun, useUi } from "./kit";
 
 export type RowFormMode = { kind: "insert"; values?: Record<string, unknown> } | { kind: "edit"; key: RowKey; row: unknown[]; hasCutCells: boolean };
 

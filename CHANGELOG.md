@@ -4,6 +4,25 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
+### Added
+
+- Agents can read rows, on a connection you open to them and label development or staging. PostgreSQL, MySQL, SQLite, SQL Server and Oracle only. Reads run in a read-only transaction that is always rolled back, at most 200 rows and 256 KiB per call.
+- Agents can propose inserts, updates and deletes. Nothing is written until you approve the exact change in the new Agent requests view, in every agent mode. Off by default.
+- A record of what agents read and asked to change, with no values, and a count on the Datawise sidebar row when requests are waiting.
+
+### Fixed
+
+- Every dialog crashed the whole app at phone width, with "Datawise UI used outside its provider". This has been there since 0.1.0.
+
+### Changed
+
+- `datawise_describe` now refuses system schemas and databases, and a database other than the one a connection names.
+- Sorting a table now also orders by its key, so paging with a sort cannot skip or repeat rows.
+- A failed connection close after a write no longer reports the write as failed.
+- `connections.json` gains an optional field. An older Datawise saving that file drops it and falls back to names only.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added

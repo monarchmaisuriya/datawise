@@ -37,7 +37,7 @@ function usePendingStore() {
 }
 
 export type PendingStore = ReturnType<typeof usePendingStore>;
-const PendingContext = createContext<PendingStore | null>(null);
+export const PendingContext = createContext<PendingStore | null>(null);
 
 export function PendingProvider({ onCount, children }: { onCount?: (count: number) => void; children: ReactNode }) {
   const store = usePendingStore();

@@ -1,10 +1,11 @@
-import { FlatList, Icon, Modal } from "@getpaseo/plugin/client/ui";
+import { FlatList, Icon } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { parseConnectionUrl } from "../shared/connection-url";
-import type { AgentAccess, ConnectionColor, ConnectionInput, ConnectionView, EnvironmentLabel, SafetyMode, TlsMode } from "../shared/contracts";
+import { rowAccessPossible } from "../shared/agent-access";
+import type { AgentAccess, AgentRowAccess, ConnectionColor, ConnectionInput, ConnectionView, EnvironmentLabel, SafetyMode, TlsMode } from "../shared/contracts";
 import { ENGINE_IDS, ENGINES, type EngineId, FIELD_LABELS } from "../shared/engines";
-import { Btn, Chip, connectionColorValue, errorText, Field, Message, useApi, useConfirm, useUi } from "./kit";
+import { Btn, Chip, connectionColorValue, errorText, Field, Message, Modal, useApi, useConfirm, useUi } from "./kit";
 import { usePreferences } from "./preferences";
 
 const SAFETY_TEXT: Record<SafetyMode, string> = {
@@ -16,6 +17,12 @@ const TLS_TEXT: Record<TlsMode, string> = {
   off: "No encryption.",
   require: "Encrypted, but the server's certificate is not checked.",
   verify: "Encrypted, and the certificate and host name are checked.",
+};
+
+const ROW_ACCESS_TEXT: Record<AgentRowAccess, string> = {
+  none: "Agents get names and types only.",
+  read: "Every agent can read rows here without asking you. Row data goes to the agent's provider and stays in that chat. Rows can hold text someone else wrote, and an agent with a shell could act on it, including writing to this database directly.",
+  propose: "Agents can also propose changes. Each one waits for you to approve it in Datawise, in every agent mode. This guards these tools only. A database user without write rights is the only full guarantee.",
 };
 
 const ENVIRONMENTS: { value: EnvironmentLabel; label: string }[] = [
@@ -46,13 +53,16 @@ function isLoopback(host: string): boolean {
   return host === "" || host === "localhost" || host === "::1" || host.startsWith("127.");
 }
 
-export function ConnectionList({ connections, loading, error, onChoose, onAdd, onEdit }: { connections: ConnectionView[]; loading: boolean; error: string | null; onChoose: (connection: ConnectionView) => void; onAdd: () => void; onEdit: (connection: ConnectionView) => void }) {
+export function ConnectionList({ connections, loading, error, onChoose, onAdd, onEdit, onAgentActivity }: { connections: ConnectionView[]; loading: boolean; error: string | null; onChoose: (connection: ConnectionView) => void; onAdd: () => void; onEdit: (connection: ConnectionView) => void; onAgentActivity: () => void }) {
   const ui = useUi();
   return (
     <View style={{ flex: 1, minHeight: 0 }}>
       <View style={[ui.toolbar, { justifyContent: "space-between" }]}>
         <Text style={ui.title}>Connections</Text>
-        <Btn icon="Plus" label="Add" kind="primary" onPress={onAdd} />
+        <View style={ui.row}>
+          <Btn icon="Bot" label="Agents" onPress={onAgentActivity} />
+          <Btn icon="Plus" label="Add" kind="primary" onPress={onAdd} />
+        </View>
       </View>
       {error ? <View style={{ padding: 12 }}><Message kind="error" text={error} /></View> : null}
       {!loading && !error && connections.length === 0 ? <View style={{ padding: 12 }}><Message kind="note" text="No connections yet." /></View> : null}
@@ -122,16 +132,16 @@ export function UnlockPrompt({ connection, onDone, onCancel }: { connection: Con
   );
 }
 
-type Draft = Required<Pick<ConnectionInput, "name" | "engine" | "host" | "user" | "database" | "file" | "serviceName" | "localDataCenter" | "region" | "endpoint" | "accessKeyId" | "authSource" | "caCertificate" | "rememberPassword">> & { port: string; tls: TlsMode; safety: SafetyMode; environment: EnvironmentLabel; color: ConnectionColor | null; group: string; agentAccess: AgentAccess; useSsh: boolean; sshHost: string; sshPort: string; sshUser: string };
+type Draft = Required<Pick<ConnectionInput, "name" | "engine" | "host" | "user" | "database" | "file" | "serviceName" | "localDataCenter" | "region" | "endpoint" | "accessKeyId" | "authSource" | "caCertificate" | "rememberPassword">> & { port: string; tls: TlsMode; safety: SafetyMode; environment: EnvironmentLabel; color: ConnectionColor | null; group: string; agentAccess: AgentAccess; agentRowAccess: AgentRowAccess; useSsh: boolean; sshHost: string; sshPort: string; sshUser: string };
 
 export type ConnectionPrefill = Partial<Pick<Draft, "name" | "engine" | "file" | "safety">>;
 
 function emptyDraft(safety: SafetyMode): Draft {
-  return { environment: "none", color: null, group: "", agentAccess: "none", name: "", engine: "postgres", host: "localhost", port: "", user: "", database: "", file: "", serviceName: "", localDataCenter: "", region: "", endpoint: "", accessKeyId: "", authSource: "", caCertificate: "", rememberPassword: true, tls: "off", safety, useSsh: false, sshHost: "", sshPort: "22", sshUser: "" };
+  return { environment: "none", color: null, group: "", agentAccess: "none", agentRowAccess: "none", name: "", engine: "postgres", host: "localhost", port: "", user: "", database: "", file: "", serviceName: "", localDataCenter: "", region: "", endpoint: "", accessKeyId: "", authSource: "", caCertificate: "", rememberPassword: true, tls: "off", safety, useSsh: false, sshHost: "", sshPort: "22", sshUser: "" };
 }
 
 function toDraft(connection: ConnectionView): Draft {
-  return { environment: connection.environment, color: connection.color, group: connection.group, agentAccess: connection.agentAccess, name: connection.name, engine: connection.engine, host: connection.host, port: connection.port === null ? "" : String(connection.port), user: connection.user, database: connection.database, file: connection.file, serviceName: connection.serviceName, localDataCenter: connection.localDataCenter, region: connection.region, endpoint: connection.endpoint, accessKeyId: connection.accessKeyId, authSource: connection.authSource, caCertificate: connection.caCertificate, rememberPassword: connection.rememberPassword, tls: connection.tls, safety: connection.safety, useSsh: connection.ssh !== null, sshHost: connection.ssh?.host ?? "", sshPort: String(connection.ssh?.port ?? 22), sshUser: connection.ssh?.user ?? "" };
+  return { environment: connection.environment, color: connection.color, group: connection.group, agentAccess: connection.agentAccess, agentRowAccess: connection.agentRowAccess, name: connection.name, engine: connection.engine, host: connection.host, port: connection.port === null ? "" : String(connection.port), user: connection.user, database: connection.database, file: connection.file, serviceName: connection.serviceName, localDataCenter: connection.localDataCenter, region: connection.region, endpoint: connection.endpoint, accessKeyId: connection.accessKeyId, authSource: connection.authSource, caCertificate: connection.caCertificate, rememberPassword: connection.rememberPassword, tls: connection.tls, safety: connection.safety, useSsh: connection.ssh !== null, sshHost: connection.ssh?.host ?? "", sshPort: String(connection.ssh?.port ?? 22), sshUser: connection.ssh?.user ?? "" };
 }
 
 export function ConnectionForm({ connection, prefill, note, onClose, onSaved, onDeleted }: { connection: ConnectionView | null; prefill?: ConnectionPrefill; note?: string; onClose: () => void; onSaved: (saved: ConnectionView) => void; onDeleted: (id: string) => void }) {
@@ -166,6 +176,9 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
     if (parsed.password) setPassword(parsed.password);
   };
 
+  const namesAllowed = info.catalogSchema && draft.environment !== "production";
+  const rowsAllowed = namesAllowed && draft.agentAccess === "schema" && rowAccessPossible(draft.engine, draft.environment);
+
   const build = (): ConnectionInput => ({
     id: connection?.id,
     name: draft.name.trim() || info.label,
@@ -187,7 +200,8 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
     environment: draft.environment,
     color: draft.color,
     group: draft.group.trim(),
-    agentAccess: info.catalogSchema && draft.environment !== "production" ? draft.agentAccess : "none",
+    agentAccess: namesAllowed ? draft.agentAccess : "none",
+    agentRowAccess: !rowsAllowed ? "none" : draft.agentRowAccess === "propose" && draft.safety === "read-only" ? "read" : draft.agentRowAccess,
     rememberPassword: draft.rememberPassword,
     ssh: draft.useSsh && info.supportsSsh ? { host: draft.sshHost.trim(), port: Number(draft.sshPort) || 22, user: draft.sshUser } : null,
     password,
@@ -296,7 +310,7 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
         </View>
         <Field label="Group" value={draft.group} onChangeText={(group) => set({ group: group.slice(0, 60) })} placeholder="Optional, such as a project name" />
 
-        {info.catalogSchema && draft.environment !== "production" ? (
+        {namesAllowed ? (
           <View style={{ gap: 4 }}>
             <Text style={ui.label}>Agents</Text>
             <View style={ui.wrap}>
@@ -304,8 +318,21 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
               <Chip label="Table and column names" on={draft.agentAccess === "schema"} onPress={() => set({ agentAccess: "schema" })} />
             </View>
             <Text style={ui.muted}>
-              {draft.agentAccess === "schema" ? "Every agent can read this connection's table names, column names and types. Never its rows. Names can hold text someone else wrote. Turning this on or off makes open agent sessions reopen before their next prompt. Agents only get this while Paseo's \"Enable Paseo tools\" host setting is on." : "Agents cannot see this connection through Datawise."}
+              {draft.agentAccess === "schema" ? "Every agent can read this connection's table names, column names and types. Names can hold text someone else wrote. Turning this on or off makes open agent sessions reopen before their next prompt. Agents only get this while Paseo's \"Enable Paseo tools\" host setting is on." : "Agents cannot see this connection through Datawise."}
             </Text>
+            {rowsAllowed ? (
+              <>
+                <Text style={[ui.label, { paddingTop: 6 }]}>Agents and rows</Text>
+                <View style={ui.wrap}>
+                  <Chip label="No rows" on={draft.agentRowAccess === "none"} onPress={() => set({ agentRowAccess: "none" })} />
+                  <Chip label="Read rows" on={draft.agentRowAccess === "read"} onPress={() => set({ agentRowAccess: "read" })} />
+                  {draft.safety === "read-only" ? null : <Chip label="Propose changes" on={draft.agentRowAccess === "propose"} onPress={() => set({ agentRowAccess: "propose" })} />}
+                </View>
+                <Text style={ui.muted}>{ROW_ACCESS_TEXT[draft.agentRowAccess === "propose" && draft.safety === "read-only" ? "read" : draft.agentRowAccess]}</Text>
+              </>
+            ) : draft.agentAccess === "schema" && ENGINES[draft.engine].transactionalEdits ? (
+              <Text style={ui.muted}>To share rows, label this connection Development or Staging.</Text>
+            ) : null}
           </View>
         ) : null}
 

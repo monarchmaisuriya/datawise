@@ -3,7 +3,7 @@ import { createContext, type ReactNode, useContext, useMemo } from "react";
 import { View } from "react-native";
 import { DEFAULT_PREFERENCES, type Preferences, preferencesDocument } from "../shared/preferences";
 
-const PreferencesContext = createContext<Preferences>(DEFAULT_PREFERENCES);
+export const PreferencesContext = createContext<Preferences>(DEFAULT_PREFERENCES);
 
 export function usePreferences(): Preferences {
   return useContext(PreferencesContext);

@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
+import { AgentRequestsModal, usePendingAgentRequests } from "./agent-requests";
 import { ConnectionForm, ConnectionList, UnlockPrompt } from "./connections";
 import { DataTab, type JumpTarget } from "./data-tab";
 import { Btn, Chip, ConfirmProvider, connectionColorValue, errorText, Message, type Theme, UiProvider, useApi, useConfirm, useUi } from "./kit";
@@ -54,6 +55,8 @@ function Main({ surface }: { surface: string }) {
   const [restored, setRestored] = useState(false);
   // Waits here until the connection can be used, as a session-only password may have to be asked for first.
   const [objectToRestore, setObjectToRestore] = useState<ObjectInfo | null>(null);
+  const [agentRequestsOpen, setAgentRequestsOpen] = useState(false);
+  const waitingRequests = usePendingAgentRequests();
 
   const list = connections.data?.connections ?? [];
   const connection = list.find((item) => item.id === connectionId) ?? null;
@@ -165,7 +168,7 @@ function Main({ surface }: { surface: string }) {
       onQuery={openQuery}
     />
   ) : (
-    <ConnectionList connections={list} loading={connections.isLoading} error={connections.error ? errorText(connections.error) : null} onChoose={choose} onAdd={() => setEditing("new")} onEdit={setEditing} />
+    <ConnectionList connections={list} loading={connections.isLoading} error={connections.error ? errorText(connections.error) : null} onChoose={choose} onAdd={() => setEditing("new")} onEdit={setEditing} onAgentActivity={() => setAgentRequestsOpen(true)} />
   );
 
   const showContent = connection !== null && !connection.needsPassword && (object !== null || tab === "query");
@@ -173,6 +176,15 @@ function Main({ surface }: { surface: string }) {
 
   return (
     <View style={ui.root}>
+      {waitingRequests > 0 ? (
+        <View style={[ui.toolbar, { backgroundColor: ui.colors.surface1 }]}>
+          <Text style={ui.warning}>
+            {waitingRequests} agent request{waitingRequests === 1 ? "" : "s"} waiting. Nothing is written until you approve.
+          </Text>
+          <Btn label="Review" kind="primary" onPress={() => setAgentRequestsOpen(true)} />
+        </View>
+      ) : null}
+      {agentRequestsOpen ? <AgentRequestsModal onClose={() => setAgentRequestsOpen(false)} /> : null}
       {connection?.needsPassword ? <UnlockPrompt connection={connection} onDone={() => connections.refetch()} onCancel={() => setConnectionId(null)} /> : null}
       {ui.compact ? (
         showContent ? content : rail

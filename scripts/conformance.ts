@@ -1146,6 +1146,272 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
     const found = await call(searchStructure, { query: "dw_child" });
     expectThat(found.items.every((entry) => !entry.id.startsWith(saved.id)), JSON.stringify(found).slice(0, 200));
   });
+  const agentA = { agent: { id: "agent-a", title: "Agent A" } };
+  const agentB = { agent: { id: "agent-b", title: "Agent B" } };
+  const useTool = async (name: string, input: unknown, context: unknown = agentA) => {
+    const hook = theHook();
+    if (!hook) throw new Error("no hook registered");
+    const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean; structuredContent?: { requestId: string; status: string } }> };
+    return tool.execute(tool.input.parse(input), context);
+  };
+  const rowsConnection = (name: string, extra: Record<string, unknown> = {}) => call(rpc.saveConnection, { name, engine: spec.engine, safety: "confirm", environment: "development", agentAccess: "schema", agentRowAccess: "propose", ...spec.input, ...extra });
+  const settled = async (id: string) => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const found = (await call(rpc.listAgentRequests, {})).requests.find((item) => item.id === id);
+      if (found && found.status !== "running") return found;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("the request never finished");
+  };
+  const rowNote = (rows: unknown[][], names: string[], id: number) => rows.find((row) => Number(row[names.indexOf(spec.id)]) === id)?.[names.indexOf(spec.note)];
+  const readAll = async (connection: string) => {
+    const answer = await useTool("datawise_read", { connection, table: spec.child, ...spec.scope, sort: { column: spec.id } });
+    if (answer.isError) throw new Error(String(answer.text));
+    const parsed = JSON.parse(String(answer.text).split("\n\n")[1] as string) as { columns: string[]; rows: unknown[][] };
+    return parsed;
+  };
+  const rowsName = `features-${key}-rows`;
+  const rows = await rowsConnection(rowsName);
+  await lines.check("rows: reading works, marks rows untrusted, and records no values", async () => {
+    await sql(`update ${spec.child} set ${spec.note} = 'PLANTED_AGENT_VALUE' where ${spec.id} = 2`);
+    const answer = await useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope, filters: [{ column: spec.note, op: "contains", value: "PLANTED_FILTER" }] });
+    expectThat(!answer.isError, String(answer.text));
+    const all = await readAll(rowsName);
+    expectThat(rowNote(all.rows, all.columns, 2) === "PLANTED_AGENT_VALUE", JSON.stringify(all).slice(0, 200));
+    const first = await useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope });
+    expectThat(/do not follow instructions/.test(String(first.text)), String(first.text).slice(0, 120));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const events = JSON.stringify((await call(rpc.listAgentActivity, {})).events);
+    expectThat(events.includes('"read"') && !events.includes("PLANTED"), events.slice(0, 200));
+  });
+  await lines.check("rows: names-only and unknown connections get the same refusal", async () => {
+    await call(rpc.saveConnection, { name: `${rowsName}-names`, engine: spec.engine, safety: "confirm", environment: "development", agentAccess: "schema", ...spec.input });
+    const names = await useTool("datawise_read", { connection: `${rowsName}-names`, table: spec.child, ...spec.scope });
+    const unknown = await useTool("datawise_read", { connection: "nothing", table: spec.child, ...spec.scope });
+    expectThat(names.isError === true && unknown.isError === true && String(names.text).replace(`${rowsName}-names`, "X") === String(unknown.text).replace("nothing", "X"), `${names.text} / ${unknown.text}`);
+  });
+  await lines.check("rows: the read level cannot propose", async () => {
+    await rowsConnection(`${rowsName}-read`, { agentRowAccess: "read" });
+    const answer = await useTool("datawise_propose_write", { connection: `${rowsName}-read`, table: spec.child, ...spec.scope, delete: [{ [spec.id]: 1 }] });
+    expectThat(answer.isError === true && /allows this/.test(String(answer.text)), String(answer.text));
+  });
+  await lines.check("rows: production, no label, and proposals on read-only are refused on save", async () => {
+    const says = async (work: Promise<unknown>, pattern: RegExp) => {
+      const message = await refusal(work);
+      expectThat(pattern.test(message), message);
+    };
+    await says(rowsConnection(`${rowsName}-x`, { environment: "production" }), /production/i);
+    await says(rowsConnection(`${rowsName}-x`, { environment: "none" }), /development or staging/);
+    await says(rowsConnection(`${rowsName}-x`, { safety: "read-only" }), /read-only/);
+    await says(rowsConnection(`${rowsName}-x`, { agentAccess: "none" }), /Share table and column names/);
+  });
+  await lines.check("rows: another database and system schemas are refused", async () => {
+    const other = await useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope, database: "elsewhere" });
+    if (spec.scope.database) expectThat(other.isError === true && /limited to/.test(String(other.text)), String(other.text));
+    if (key === "postgres") {
+      const catalog = await useTool("datawise_read", { connection: rowsName, table: "pg_authid", ...spec.scope, schema: "pg_catalog" });
+      expectThat(catalog.isError === true && !String(catalog.text).includes("rolpassword"), String(catalog.text));
+      const information = await useTool("datawise_describe", { connection: rowsName, table: "tables", ...spec.scope, schema: "information_schema" });
+      expectThat(information.isError === true, String(information.text));
+    }
+    const missing = await useTool("datawise_read", { connection: rowsName, table: "no_such_table", ...spec.scope });
+    expectThat(missing.isError === true, String(missing.text));
+  });
+  // In No Prompts too: the rule is about Datawise's own approval, not the connection's write mode.
+  const propose = async (connection: string, change: Record<string, unknown>, context: unknown = agentA) => {
+    const answer = await useTool("datawise_propose_write", { connection, table: spec.child, ...spec.scope, ...change }, context);
+    if (answer.isError) throw new Error(String(answer.text));
+    return answer.structuredContent?.requestId as string;
+  };
+  await lines.check("rows: nothing is written until approved, on No Prompts too", async () => {
+    const open = `${rowsName}-open`;
+    await rowsConnection(open, { safety: "open" });
+    const id = await propose(open, { update: [{ key: { [spec.id]: 1 }, changes: { [spec.note]: "approved value" } }] });
+    const before = await readAll(rowsName);
+    expectThat(rowNote(before.rows, before.columns, 1) !== "approved value", "wrote before approval");
+    const pending = await useTool("datawise_write_status", { requestId: id });
+    expectThat(pending.structuredContent?.status === "pending", String(pending.text));
+    const detail = await call(rpc.getAgentRequest, { id });
+    const item = detail.items[0];
+    expectThat(item?.kind === "update" && item.changes[0]?.after === "approved value", JSON.stringify(detail.items).slice(0, 200));
+    expectThat(detail.request.place.endsWith(spec.child), detail.request.place);
+    await call(rpc.decideAgentRequest, { id, approve: true });
+    const done = await settled(id);
+    expectThat(done.status === "done" && done.affected === 1, `${done.status}: ${done.message}`);
+    const after = await readAll(rowsName);
+    expectThat(rowNote(after.rows, after.columns, 1) === "approved value", "the approved change is not there");
+    await refusal(call(rpc.decideAgentRequest, { id, approve: true }));
+  });
+  await lines.check("rows: a rejected request writes nothing", async () => {
+    const id = await propose(rowsName, { delete: [{ [spec.id]: 2 }] });
+    await call(rpc.decideAgentRequest, { id, approve: false });
+    const status = await useTool("datawise_write_status", { requestId: id });
+    expectThat(status.structuredContent?.status === "rejected", String(status.text));
+    expectThat((await readAll(rowsName)).rows.length === 2, "the row was deleted");
+  });
+  await lines.check("rows: a row changed after the proposal rolls back, and the agent gets no driver text", async () => {
+    const id = await propose(rowsName, { update: [{ key: { [spec.id]: 1 }, changes: { [spec.note]: "must not stay" } }, { key: { [spec.id]: 2 }, changes: { [spec.note]: "stale" } }] });
+    await sql(`update ${spec.child} set ${spec.big} = 77 where ${spec.id} = 1`);
+    await sql(`update ${spec.child} set ${spec.note} = 'changed elsewhere' where ${spec.id} = 2`);
+    await call(rpc.decideAgentRequest, { id, approve: true });
+    const failed = await settled(id);
+    expectThat(failed.status === "failed" && /changed after you edited/.test(String(failed.message)), `${failed.status}: ${failed.message}`);
+    const status = await useTool("datawise_write_status", { requestId: id });
+    expectThat(!/changed elsewhere|edited/.test(String(status.text)), String(status.text));
+    const after = await readAll(rowsName);
+    expectThat(rowNote(after.rows, after.columns, 1) === "approved value", "the first edit stayed");
+  });
+  await lines.check("rows: a delete of a row changed after the proposal rolls back", async () => {
+    const id = await propose(rowsName, { delete: [{ [spec.id]: 2 }] });
+    await sql(`update ${spec.child} set ${spec.big} = 78 where ${spec.id} = 2`);
+    await call(rpc.decideAgentRequest, { id, approve: true });
+    expectThat((await settled(id)).status === "failed", "it did not fail");
+    expectThat((await readAll(rowsName)).rows.length === 2, "the row was deleted");
+  });
+  await lines.check("rows: inserts land together or not at all", async () => {
+    const good = { [spec.id]: 50, [spec.pa]: null, [spec.pb]: null, [spec.note]: "first", [spec.big]: 1 };
+    const clash = { [spec.id]: 1, [spec.pa]: null, [spec.pb]: null, [spec.note]: "clash", [spec.big]: 1 };
+    const failing = await propose(rowsName, { insert: [good, clash] });
+    await call(rpc.decideAgentRequest, { id: failing, approve: true });
+    expectThat((await settled(failing)).status === "failed", "a clashing key did not fail");
+    expectThat((await readAll(rowsName)).rows.length === 2, "a row stayed");
+    const fine = await propose(rowsName, { insert: [good] });
+    await call(rpc.decideAgentRequest, { id: fine, approve: true });
+    expectThat((await settled(fine)).status === "done", "the insert failed");
+    expectThat((await readAll(rowsName)).rows.length === 3, "the row is not there");
+    const remove = await propose(rowsName, { delete: [{ [spec.id]: 50 }] });
+    await call(rpc.decideAgentRequest, { id: remove, approve: true });
+    expectThat((await settled(remove)).status === "done", "the delete failed");
+  });
+  await lines.check("rows: bad requests are refused and nothing waits", async () => {
+    const before = (await call(rpc.listAgentRequests, {})).requests.filter((item) => item.status === "pending").length;
+    const says = async (change: Record<string, unknown>, pattern: RegExp) => {
+      const message = await refusal(propose(rowsName, change));
+      expectThat(pattern.test(message), message);
+    };
+    await says({ insert: [{ [spec.id]: 60 }], delete: [{ [spec.id]: 2 }] }, /apart from/);
+    await says({ update: [{ key: { [spec.id]: 1 }, changes: { [spec.id]: 9 } }] }, /key column/);
+    await says({ update: [{ key: { [spec.id]: 1 }, changes: { no_such_column: 1 } }] }, /no column named/);
+    await says({ update: [{ key: { [spec.id]: 1 }, changes: { [spec.note]: { "$datawise.bytes": "not base64!" } } }] }, /Binary values/);
+    await says({ delete: [{ [spec.id]: 999 }] }, /No row matches/);
+    await says({ delete: [{ [spec.id]: 1 }, { [spec.id]: "1" }] }, /same row/);
+    await says({}, /nothing to change/);
+    await says({ delete: Array.from({ length: 101 }, (_, index) => ({ [spec.id]: index })) }, /at most 100/);
+    await says({ insert: [{ [spec.id]: 61, [spec.note]: "x".repeat(1024 * 1024 + 10) }] }, /too large/);
+    expectThat((await call(rpc.listAgentRequests, {})).requests.filter((item) => item.status === "pending").length === before, "something was left waiting");
+  });
+  await lines.check("rows: an agent cannot see another agent's request, and limits hold", async () => {
+    const ids: string[] = [];
+    for (let index = 0; index < 5; index += 1) ids.push(await propose(rowsName, { delete: [{ [spec.id]: 2 }] }, agentB));
+    const other = await useTool("datawise_write_status", { requestId: ids[0] });
+    expectThat(other.isError === true && /no such request/.test(String(other.text)), String(other.text));
+    const message = await refusal(propose(rowsName, { delete: [{ [spec.id]: 2 }] }, agentB));
+    expectThat(/already have 5/.test(message), message);
+    const others = [{ agent: { id: "agent-c", title: "C" } }, { agent: { id: "agent-d", title: "D" } }, { agent: { id: "agent-e", title: "E" } }];
+    for (const context of others) for (let index = 0; index < 5; index += 1) ids.push(await propose(rowsName, { delete: [{ [spec.id]: 2 }] }, context));
+    const full = await refusal(propose(rowsName, { delete: [{ [spec.id]: 2 }] }, { agent: { id: "agent-f", title: "F" } }));
+    expectThat(/already has 20/.test(full), full);
+    for (const id of ids) await call(rpc.decideAgentRequest, { id, approve: false });
+  });
+  await lines.check("rows: deleting a connection expires what waits on it, and removes its activity", async () => {
+    const gone = `${rowsName}-gone`;
+    const saved = await rowsConnection(gone);
+    const id = await propose(gone, { delete: [{ [spec.id]: 2 }] });
+    await call(rpc.deleteConnection, { id: saved.id });
+    expectThat((await useTool("datawise_write_status", { requestId: id })).structuredContent?.status === "expired", "still waiting");
+    await refusal(call(rpc.decideAgentRequest, { id, approve: true }));
+    expectThat(!(await call(rpc.listAgentActivity, {})).events.some((event) => event.connectionId === saved.id), "activity kept");
+  });
+  await lines.check("rows: more than 200 rows is refused", async () => {
+    await refusal(useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope, limit: 201 }));
+    await refusal(useTool("datawise_read", { connection: rowsName, table: spec.child, ...spec.scope, limit: 0 }));
+  });
+  await lines.check("rows: saving a connection expires what waits on it", async () => {
+    const id = await propose(rowsName, { delete: [{ [spec.id]: 2 }] });
+    await rowsConnection(rowsName, { id: rows.id });
+    const status = await useTool("datawise_write_status", { requestId: id });
+    expectThat(status.structuredContent?.status === "expired", String(status.text));
+    await refusal(call(rpc.decideAgentRequest, { id, approve: true }));
+    expectThat((await readAll(rowsName)).rows.length === 2, "the row was deleted");
+  });
+  await lines.check("rows: an unknown request says a change may have landed", async () => {
+    const status = await useTool("datawise_write_status", { requestId: "gone" });
+    expectThat(/may or may not have landed/.test(String(status.text)), String(status.text));
+  });
+  if (key === "postgres") {
+    await lines.check("rows: a view whose function writes cannot write through a read", async () => {
+      await sql("drop view if exists dw_writing_view");
+      await sql("create or replace function dw_touch() returns int language plpgsql as $$ begin update dw_child set note = 'written by a view' where id = 1; return 1; end $$");
+      await sql("create view dw_writing_view as select dw_touch() as n");
+      const refused = await useTool("datawise_read", { connection: rowsName, table: "dw_writing_view", ...spec.scope });
+      // Refused, and not merely rolled back: the read-only transaction stopped the function.
+      expectThat(refused.isError === true, String(refused.text).slice(0, 200));
+      const after = await readAll(rowsName);
+      expectThat(rowNote(after.rows, after.columns, 1) !== "written by a view", "the view wrote");
+      await sql("drop view dw_writing_view");
+      await sql("drop function dw_touch");
+    });
+  }
+  if (key === "postgres" || key === "sqlite") {
+    await lines.check("rows: long values are cut and marked, and binary shows only a size", async () => {
+      const table = "dw_blobs";
+      await sql(`drop table if exists ${table}`);
+      await sql(`create table ${table} (id integer primary key, body text, raw ${key === "postgres" ? "bytea" : "blob"})`);
+      await sql(key === "postgres" ? `insert into ${table} values (1, repeat('x', 5000), 'PLANTEDBYTES'::bytea)` : `insert into ${table} values (1, '${"x".repeat(5000)}', CAST('PLANTEDBYTES' AS BLOB))`);
+      const answer = await useTool("datawise_read", { connection: rowsName, table, ...spec.scope });
+      const text = String(answer.text);
+      expectThat(text.includes('"cutValues":[{"row":0,"column":"body"}]') && !text.includes("x".repeat(2100)), text.slice(0, 200));
+      expectThat(text.includes("<12 bytes>") && !text.includes("PLANTEDBYTES") && !text.includes(Buffer.from("PLANTEDBYTES").toString("base64")), text.slice(-200));
+      await sql(`drop table ${table}`);
+      await sql("drop table if exists dw_many");
+      await sql("create table dw_many (id integer primary key, body text)");
+      for (let start = 1; start <= 250; start += 50) {
+        const values = Array.from({ length: 50 }, (_, index) => `(${start + index}, '${"y".repeat(1900)}')`).join(",");
+        await sql(`insert into dw_many values ${values}`);
+      }
+      let cursor: string | undefined;
+      const seen: number[] = [];
+      for (let call_ = 0; call_ < 20; call_ += 1) {
+        const page = await useTool("datawise_read", { connection: rowsName, table: "dw_many", ...spec.scope, limit: 200, sort: { column: "id" }, ...(cursor ? { cursor } : {}) });
+        const text = String(page.text);
+        expectThat(!page.isError && Buffer.byteLength(text) < 256 * 1024 + 2048, `${Buffer.byteLength(text)} bytes`);
+        const parsed = JSON.parse(text.split("\n\n")[1] as string) as { rows: unknown[][]; nextCursor: string | null };
+        expectThat(parsed.rows.length <= 200, `${parsed.rows.length} rows`);
+        seen.push(...parsed.rows.map((row) => Number(row[0])));
+        if (!parsed.nextCursor) break;
+        cursor = parsed.nextCursor;
+      }
+      expectThat(seen.length === 250 && new Set(seen).size === 250, `${seen.length} rows, ${new Set(seen).size} different`);
+      await sql("drop table dw_many");
+      if (key === "postgres") {
+        await sql("drop table if exists dw_arrays");
+        await sql("create table dw_arrays (id integer primary key, parts bytea[])");
+        await sql("insert into dw_arrays values (1, array['PLANTEDBYTES'::bytea])");
+        const nested = String((await useTool("datawise_read", { connection: rowsName, table: "dw_arrays", ...spec.scope })).text);
+        expectThat(nested.includes("<12 bytes>") && !nested.includes(Buffer.from("PLANTEDBYTES").toString("base64")), nested.slice(-160));
+        await sql("drop table dw_arrays");
+      }
+    });
+  }
+  if (key === "mysql") {
+    await lines.check("rows: a loose key shows the real row, and system databases are refused", async () => {
+      const id = await propose(rowsName, { delete: [{ [spec.id]: "2abc" }] });
+      const detail = await call(rpc.getAgentRequest, { id });
+      const item = detail.items[0];
+      expectThat(item?.kind === "delete" && String(item.key[spec.id]) === "2", JSON.stringify(detail.items).slice(0, 200));
+      await call(rpc.decideAgentRequest, { id, approve: false });
+      const open = `${rowsName}-nodb`;
+      await rowsConnection(open, { database: "" });
+      const system = await useTool("datawise_read", { connection: open, table: "user", database: "mysql" });
+      expectThat(system.isError === true && !String(system.text).includes("authentication_string"), String(system.text).slice(0, 200));
+      const chosen = await useTool("datawise_read", { connection: open, table: spec.child, database: "dw" });
+      expectThat(!chosen.isError, String(chosen.text).slice(0, 200));
+      await rowsConnection(`${rowsName}-sys`, { database: "mysql" });
+      const pinned = await useTool("datawise_read", { connection: `${rowsName}-sys`, table: "user" });
+      expectThat(pinned.isError === true && /system database/.test(String(pinned.text)), String(pinned.text).slice(0, 200));
+    });
+  }
+  for (const connection of (await call(rpc.listConnections, {})).connections) if (connection.name.startsWith(rowsName)) await call(rpc.deleteConnection, { id: connection.id });
   if (key === "mysql" || key === "mariadb") {
     await lines.check("a table that cannot roll back is refused", async () => {
       await sql("drop table if exists dw_myisam");
@@ -1153,6 +1419,10 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
       await sql("insert into dw_myisam values (1, 'a')");
       const message = await refusal(call(rpc.writeBatch, { ref: { ...scope, name: "dw_myisam" }, edits: [{ kind: "update", key: { id: 1 }, original: { note: "a" }, changes: { note: "b" } }], confirmed: true }));
       expectThat(/storage engine/.test(message), message);
+      await rowsConnection(`${rowsName}-myisam`);
+      const proposed = await useTool("datawise_propose_write", { connection: `${rowsName}-myisam`, table: "dw_myisam", ...spec.scope, update: [{ key: { id: 1 }, changes: { note: "b" } }] });
+      expectThat(proposed.isError === true && /storage engine/.test(String(proposed.text)), String(proposed.text));
+      for (const connection of (await call(rpc.listConnections, {})).connections) if (connection.name === `${rowsName}-myisam`) await call(rpc.deleteConnection, { id: connection.id });
       await sql("drop table dw_myisam");
     });
     await lines.check("an enum's values stay out of the agent tool", async () => {

@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { agentAccess, connectionColor, type ConnectionView, connectionInput, environmentLabel, type HistoryEntry, historyEntry, type SavedQuery, safetyMode, savedQuery, sshInput, tlsMode, engineId } from "../shared/contracts";
+import { agentAccess, agentRowAccess, connectionColor, type ConnectionView, connectionInput, environmentLabel, type HistoryEntry, historyEntry, type SavedQuery, safetyMode, savedQuery, sshInput, tlsMode, engineId } from "../shared/contracts";
+import { agentRowAccessRefusal } from "../shared/agent-access";
 import { ENGINES } from "../shared/engines";
 import { registerSecret } from "./errors";
 
@@ -29,6 +30,7 @@ const storedConnection = z.object({
   color: connectionColor.nullable().default(null),
   group: z.string().default(""),
   agentAccess: agentAccess.default("none"),
+  agentRowAccess: agentRowAccess.default("none"),
   ssh: sshInput.nullable().default(null),
   rememberPassword: z.boolean().default(true),
   sshHostFingerprint: z.string().nullable().default(null),
@@ -78,6 +80,7 @@ export function toView(connection: StoredConnection): ConnectionView {
     color: connection.color,
     group: connection.group,
     agentAccess: connection.agentAccess,
+    agentRowAccess: connection.agentRowAccess,
     ssh: connection.ssh,
     sshHostFingerprint: connection.sshHostFingerprint,
     rememberPassword: connection.rememberPassword,
@@ -165,6 +168,8 @@ export class Store {
       if (input.environment === "production") throw new Error("A production connection cannot be shared with agents.");
       if (!ENGINES[input.engine].catalogSchema) throw new Error(`${ENGINES[input.engine].label} structure comes from the data itself, so it cannot be shared with agents without sharing data.`);
     }
+    const refusal = agentRowAccessRefusal(input);
+    if (refusal) throw new Error(refusal);
     const existing = input.id ? (await this.load()).connections.find((item) => item.id === input.id) : undefined;
     const secret = (field: (typeof SECRET_FIELDS)[number]): string | null => {
       const change = input[field];

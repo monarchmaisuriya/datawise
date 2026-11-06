@@ -41,6 +41,14 @@ export function fromCell(value: unknown): unknown {
   return value;
 }
 
+// For a reader that must get a size and no content, even inside an array or a document.
+function hideBytes(value: unknown): unknown {
+  if (isBytes(value)) return `<${value.length} bytes>`;
+  if (Array.isArray(value)) return value.map(hideBytes);
+  if (value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, hideBytes(item)]));
+  return value;
+}
+
 export interface FinishedRows {
   rows: unknown[][];
   cutCells: [number, number][];
@@ -48,7 +56,7 @@ export interface FinishedRows {
 }
 
 // Applies the cell and response limits. Cut cells are listed so the client can refuse to write them.
-export function finishRows(raw: unknown[][], rowLimit: number | null = null, cellLimit = CELL_LIMIT): FinishedRows {
+export function finishRows(raw: unknown[][], rowLimit: number | null = null, cellLimit = CELL_LIMIT, bytesAsSize = false): FinishedRows {
   const rows: unknown[][] = [];
   const cutCells: [number, number][] = [];
   let size = 0;
@@ -59,7 +67,7 @@ export function finishRows(raw: unknown[][], rowLimit: number | null = null, cel
       break;
     }
     const row = rawRow.map((rawCell, columnIndex) => {
-      const cell = toCell(rawCell);
+      const cell = toCell(bytesAsSize ? hideBytes(rawCell) : rawCell);
       const text = typeof cell === "string" ? cell : cell !== null && typeof cell === "object" ? JSON.stringify(cell) : "";
       if (text.length <= cellLimit) {
         size += text.length + 8;
