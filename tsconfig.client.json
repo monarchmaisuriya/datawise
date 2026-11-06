@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["react"] },
+  "include": ["index.client.tsx", "client/**/*.ts", "client/**/*.tsx", "shared/**/*.ts"],
+  "exclude": ["**/*.test.ts"]
+}

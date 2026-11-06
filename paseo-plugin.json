@@ -1,0 +1,7 @@
+{
+  "id": "datawise",
+  "name": "Datawise",
+  "description": "A database client for Paseo: browse, query, edit, import and export PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j.",
+  "requirements": { "paseo": ">=0.15.0" },
+  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
+}
