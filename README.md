@@ -1,14 +1,33 @@
+<img src="datawise.png" width="160" alt="Datawise logo">
+
 # Datawise
 
-A database client for [Paseo](https://paseo.sh). See [OVERVIEW.md](OVERVIEW.md) for what it does and its limits.
+A database client for [Paseo](https://paseo.sh): browse, query, edit, import and export data from PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j. See [OVERVIEW.md](OVERVIEW.md) for what it does and its limits.
+
+Current release: **v0.1.0**. Datawise follows [Semantic Versioning](https://semver.org/); while it is below 1.0.0, a minor release may include breaking changes. See [CHANGELOG.md](CHANGELOG.md).
+
+Requires Paseo 0.15 or later, and `npm` on the daemon machine's `PATH`.
 
 ## Install
 
 ```bash
+paseo plugin install git:https://github.com/monarchmaisuriya/datawise.git --ref v0.1.0
+```
+
+To move to a later release:
+
+```bash
+paseo plugin update datawise --ref v0.2.0
+```
+
+To run from a working copy instead, install its dependencies first. Paseo then runs that folder directly, and `paseo plugin reload datawise` picks up edits.
+
+```bash
+npm ci --omit=dev --ignore-scripts
 paseo plugin install /path/to/datawise
 ```
 
-From a git remote, Paseo runs `npm ci --omit=dev --ignore-scripts` itself. For a directory install, run that first.
+Saved connections live in Paseo's `plugin-data/datawise` folder, so they stay in place across updates and reinstalls.
 
 ## Develop
 
