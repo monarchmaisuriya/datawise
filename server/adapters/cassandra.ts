@@ -2,7 +2,7 @@ import type { Client, ClientOptions } from "cassandra-driver";
 import { loadDriver } from "../drivers";
 import { tlsClientOptions } from "../tls";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, WriteOp } from "../../shared/contracts";
-import { finishRows, fromCell } from "../cells";
+import { finishRows, fromCell, positionsOf } from "../cells";
 import { errorMessage } from "../errors";
 import { classifyCql, splitStatements } from "../sql-script";
 import { ansiQuote, PartialRunError, renderLiteral, STREAM_BATCH } from "./sql-base";
@@ -151,7 +151,7 @@ class CassandraAdapter implements Adapter {
     return decoded;
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     if (query.sort) throw new Error("Cassandra returns rows in clustering order only, so a table cannot be sorted here.");
     const client = await this.client();
     const columns = await this.columnRows(ref);
@@ -160,7 +160,7 @@ class CassandraAdapter implements Adapter {
     const result = await client.execute(`SELECT * FROM ${this.table(ref)}${where.sql}${where.filtering ? " ALLOW FILTERING" : ""}`, where.params, { prepare: true, fetchSize: query.limit, pageState: query.cursor ?? undefined });
     const names = result.columns?.map((column) => column.name) ?? columns.map((column) => column.name);
     const key = view ? [] : this.keyOf(columns);
-    const finished = finishRows(result.rows.map((row) => names.map((name) => this.toPlain(row.get(name)))));
+    const finished = finishRows(result.rows.map((row) => names.map((name) => this.toPlain(row.get(name)))), null, cellLimit, false, positionsOf(names, key));
     return {
       columns: names.map((name) => ({ name, type: columns.find((column) => column.name === name)?.type ?? null, nullable: !key.includes(name), defaultValue: null, isKey: key.includes(name), generated: false })),
       keyColumns: key,

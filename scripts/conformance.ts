@@ -4,11 +4,12 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z, type ZodType } from "zod";
-import { type ConnectionInput, type JobView, type Filter, type ObjectRef, type RowPage, rpc, searchStructure, type StartResult } from "../shared/contracts";
+import { type ConnectionInput, type JobView, type Filter, type ObjectRef, type RowPage, rpc, searchStructure, type StartResult, BYTES_SIZE, BYTES_TAG } from "../shared/contracts";
 import { jumpFilters } from "../shared/foreign-keys";
 import { preferencesSchema } from "../shared/preferences";
 import { ENGINES, type EngineId } from "../shared/engines";
 import { ADAPTERS } from "../server/adapters";
+import { CELL_LIMIT } from "../server/cells";
 import { setDriverRoot } from "../server/drivers";
 import { contributeServer } from "../server/plugin";
 import { PreferencesReader } from "../server/preferences";
@@ -314,6 +315,29 @@ const EXTRAS: Record<string, (tools: Tools) => Promise<void>> = {
       await tools.finish(await call(rpc.writeRows, { ref: key("dw_list"), op: { kind: "delete", keys: [keyOf(fresh, fresh.rows[0] as unknown[]), keyOf(fresh, fresh.rows[3] as unknown[])] }, confirmed: true }));
       expect(JSON.stringify(await queryRows(tools, "LRANGE dw_list 0 -1")) === JSON.stringify([["a"], ["B"]]), "delete wrong");
     });
+    await check("set: a member longer than a cell arrives whole, and renaming it replaces it", async () => {
+      const long = "m".repeat(CELL_LIMIT + 100);
+      await tools.finish(await tools.run(`DEL dw_set\nSADD dw_set ${long}`));
+      const page = await call(rpc.readRows, { ref: key("dw_set"), query: {} });
+      const member = keyOf(page, page.rows[0] as unknown[]).member;
+      expect(member === long && page.cutCells.length === 0, `member length ${String(member).length}, cut ${JSON.stringify(page.cutCells)}`);
+      await tools.finish(await call(rpc.writeRows, { ref: key("dw_set"), op: { kind: "update", key: { member }, changes: { member: "short" } }, confirmed: true }));
+      expect(JSON.stringify(await queryRows(tools, "SMEMBERS dw_set")) === JSON.stringify([["short"]]), "old member left behind");
+    });
+    await check("list: a long value is cut on the page, and the whole one still finds the entry", async () => {
+      const long = "v".repeat(5000);
+      await tools.finish(await tools.run(`DEL dw_longlist\nRPUSH dw_longlist ${long}`));
+      const page = await call(rpc.readRows, { ref: key("dw_longlist"), query: {} });
+      const shown = keyOf(page, page.rows[0] as unknown[]);
+      expect(String(shown.value).length < long.length && JSON.stringify(page.cutCells) === JSON.stringify([[0, 1]]), `shown ${String(shown.value).length}, cut ${JSON.stringify(page.cutCells)}`);
+      const whole = await call(rpc.readRow, { ref: key("dw_longlist"), key: shown });
+      const value = whole.rows[0]?.[1];
+      expect(value === long, `whole length ${String(value).length}`);
+      const refused = await failsAs(tools, key("dw_longlist"), { kind: "update", key: shown, changes: { value: "x" } });
+      expect(refused?.status === "failed", `a cut key was accepted: ${refused?.status}`);
+      await tools.finish(await call(rpc.writeRows, { ref: key("dw_longlist"), op: { kind: "update", key: { index: 0, value }, changes: { value: "x" } }, confirmed: true }));
+      expect(JSON.stringify(await queryRows(tools, "LRANGE dw_longlist 0 -1")) === JSON.stringify([["x"]]), "edit missing");
+    });
     await check("sorted set: a bad score changes nothing and is reported", async () => {
       await tools.finish(await tools.run("DEL dw_z\nZADD dw_z 1 m"));
       const job = await failsAs(tools, key("dw_z"), { kind: "update", key: { member: "m" }, changes: { member: "n", score: "abc" } });
@@ -333,6 +357,36 @@ const EXTRAS: Record<string, (tools: Tools) => Promise<void>> = {
     await tools.finish(await tools.run("DEL dw_list dw_z dw_s"));
   },
   async postgres(tools) {
+    await tools.check("a key longer than a cell arrives whole, and a write through it lands on that row", async () => {
+      await tools.finish(await tools.run("drop table if exists dw_longkey"));
+      await tools.finish(await tools.run(`create table dw_longkey (k text primary key, v text); insert into dw_longkey values (repeat('k', ${CELL_LIMIT + 100}), 'old'), ('short', repeat('v', ${CELL_LIMIT + 100}))`));
+      const page = await tools.call(rpc.readRows, { ref: { ...tools.ref(), name: "dw_longkey" }, query: { sort: { column: "k", descending: false } } });
+      const k = page.rows[0]?.[0];
+      tools.expect(typeof k === "string" && k.length === CELL_LIMIT + 100, `key length ${String(k).length}`);
+      tools.expect(JSON.stringify(page.cutCells) === JSON.stringify([[1, 1]]), `cut ${JSON.stringify(page.cutCells)}`);
+      await tools.finish(await tools.call(rpc.writeRows, { ref: { ...tools.ref(), name: "dw_longkey" }, op: { kind: "update", key: { k }, changes: { v: "new" } }, confirmed: true }));
+      const after = await queryRows(tools, `select v from dw_longkey where length(k) > 100`);
+      tools.expect(JSON.stringify(after) === JSON.stringify([["new"]]), `after ${JSON.stringify(after)}`);
+      await tools.finish(await tools.run("drop table dw_longkey"));
+    });
+    await tools.check("the grid gets a preview of a long value; the row and a query get all of it", async () => {
+      await tools.finish(await tools.run("drop table if exists dw_preview"));
+      await tools.finish(await tools.run("create table dw_preview (id int primary key, body text); insert into dw_preview values (1, repeat('b', 10000))"));
+      const ref = { ...tools.ref(), name: "dw_preview" };
+      const page = await tools.call(rpc.readRows, { ref, query: {} });
+      const preview = page.rows[0]?.[1];
+      tools.expect(typeof preview === "string" && preview.length === preferencesSchema.parse({}).cellPreviewChars, `preview length ${String(preview).length}`);
+      tools.expect(JSON.stringify(page.cutCells) === JSON.stringify([[0, 1]]), `cut ${JSON.stringify(page.cutCells)}`);
+      const row = await tools.call(rpc.readRow, { ref, key: { id: 1 } });
+      tools.expect(String(row.rows[0]?.[1]).length === 10000, `row length ${String(row.rows[0]?.[1]).length}`);
+      const rows = await queryRows(tools, "select body from dw_preview");
+      tools.expect(String(rows[0]?.[0]).length === 10000, `query length ${String(rows[0]?.[0]).length}`);
+      await tools.finish(await tools.run("alter table dw_preview add column blob bytea; update dw_preview set blob = decode(repeat('ab', 2048), 'hex')"));
+      const binary = await tools.call(rpc.readRows, { ref, query: {} });
+      const blob = binary.rows[0]?.[2] as Record<string, unknown> | undefined;
+      tools.expect(typeof blob?.[BYTES_TAG] === "string" && blob[BYTES_SIZE] === 2048, `blob ${JSON.stringify(blob).slice(0, 80)}`);
+      await tools.finish(await tools.run("drop table dw_preview"));
+    });
     await tools.check("JSON: editing a sibling leaves a long number in place", async () => {
       await tools.finish(await tools.run(`update dw_items set doc = '{"big":12345678901234567890,"a":1}' where id = 2`));
       const page = await tools.call(rpc.readRow, { ref: tools.ref(), key: { id: "2" } });
@@ -1532,7 +1586,7 @@ async function runSettingsAndViews() {
   await lines.check("views and tabs save, stay private, and go with their connection", async () => {
     const saved = await call(rpc.saveConnection, { name: "views", ...base });
     const ref = { connectionId: saved.id, name: "t" };
-    const view = { hiddenColumns: ["id"], columnOrder: ["b", "a"], sort: { column: "a", descending: true }, filtersInUse: [], filters: [{ name: "mine", filters: [{ column: "a", op: "eq", value: "secret" }] }] };
+    const view = { hiddenColumns: ["id"], columnOrder: ["b", "a"], sort: { column: "a", descending: true }, filtersInUse: [], filters: [{ name: "mine", filters: [{ column: "a", op: "eq", value: "secret" }] }], columnWidths: { a: 140 } };
     await call(rpc.saveView, { ref, view });
     expectThat(JSON.stringify(await call(rpc.getView, ref)) === JSON.stringify(view), "view changed on the way back");
     expectThat((statSync(join(folder, "views.json")).mode & 0o777) === 0o600, "views.json is not private");

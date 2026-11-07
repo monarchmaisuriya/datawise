@@ -1,4 +1,4 @@
-import { BYTES_TAG } from "../shared/contracts";
+import { BYTES_SIZE, BYTES_TAG, bytesSize } from "../shared/contracts";
 
 export const CELL_LIMIT = 16 * 1024;
 export const RESPONSE_LIMIT = 32 * 1024 * 1024;
@@ -55,8 +55,14 @@ export interface FinishedRows {
   truncated: boolean;
 }
 
+// Positions of the named columns, for finishRows' columns to keep whole.
+export function positionsOf(names: readonly string[], wanted: readonly string[]): number[] {
+  return wanted.map((name) => names.indexOf(name)).filter((position) => position !== -1);
+}
+
 // Applies the cell and response limits. Cut cells are listed so the client can refuse to write them.
-export function finishRows(raw: unknown[][], rowLimit: number | null = null, cellLimit = CELL_LIMIT, bytesAsSize = false): FinishedRows {
+// Key columns are kept whole: a row's key is how a later write finds that row, and a cut key names a different one.
+export function finishRows(raw: unknown[][], rowLimit: number | null = null, cellLimit = CELL_LIMIT, bytesAsSize = false, keepWhole: readonly number[] = []): FinishedRows {
   const rows: unknown[][] = [];
   const cutCells: [number, number][] = [];
   let size = 0;
@@ -69,12 +75,15 @@ export function finishRows(raw: unknown[][], rowLimit: number | null = null, cel
     const row = rawRow.map((rawCell, columnIndex) => {
       const cell = toCell(bytesAsSize ? hideBytes(rawCell) : rawCell);
       const text = typeof cell === "string" ? cell : cell !== null && typeof cell === "object" ? JSON.stringify(cell) : "";
-      if (text.length <= cellLimit) {
+      if (text.length <= cellLimit || keepWhole.includes(columnIndex)) {
         size += text.length + 8;
         return cell;
       }
       cutCells.push([rowIndex, columnIndex]);
       size += cellLimit + 8;
+      // Binary stays binary when cut: the start of its bytes and its whole size, never a piece of JSON text.
+      const base64 = cell !== null && typeof cell === "object" ? Reflect.get(cell, BYTES_TAG) : undefined;
+      if (typeof base64 === "string" && cell !== null && typeof cell === "object") return { [BYTES_TAG]: base64.slice(0, Math.max(4, Math.floor(cellLimit / 4) * 4)), [BYTES_SIZE]: bytesSize(cell) };
       return text.slice(0, cellLimit);
     });
     if (size > RESPONSE_LIMIT) {

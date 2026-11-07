@@ -75,7 +75,7 @@ const onStray = (error: unknown) => console.error("Datawise: stray driver error:
 
 const ATTACHMENT_MATCHES = 10;
 const ACTIVITY_LIMIT = 500;
-const EMPTY_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [] };
+const EMPTY_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [], columnWidths: {} };
 
 function viewKey(ref: ObjectRef): string {
   return JSON.stringify([ref.connectionId, ref.database ?? null, ref.schema ?? null, ref.name]);
@@ -212,7 +212,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   server.handle(rpc.listSchemas, guard(async (scope: Scope) => ({ schemas: await withDeadline(pool.use(scope.connectionId, (adapter) => adapter.listSchemas(scope))) })));
   server.handle(rpc.listObjects, guard(async (input: RpcInput<typeof rpc.listObjects>) => withDeadline(pool.use(input.connectionId, (adapter) => adapter.listObjects(input, { pattern: input.pattern, cursor: input.cursor })))));
   server.handle(rpc.describeObject, guard(async (ref: ObjectRef) => withDeadline(pool.use(ref.connectionId, (adapter) => adapter.describe(ref)))));
-  server.handle(rpc.readRows, guard(async ({ ref, query }: RpcInput<typeof rpc.readRows>) => withDeadline(pool.use(ref.connectionId, (adapter) => adapter.read(ref, query)))));
+  server.handle(rpc.readRows, guard(async ({ ref, query }: RpcInput<typeof rpc.readRows>) => withDeadline(pool.use(ref.connectionId, async (adapter) => adapter.read(ref, query, (await preferences.get()).cellPreviewChars)))));
   server.handle(rpc.readRow, guard(async ({ ref, key }: RpcInput<typeof rpc.readRow>) => withDeadline(pool.use(ref.connectionId, (adapter) => adapter.readRow(ref, key)))));
   server.handle(rpc.countRows, guard(async ({ ref, filters }: RpcInput<typeof rpc.countRows>) => jobs.start("count", null, async () => ({ count: await pool.use(ref.connectionId, (adapter) => adapter.count(ref, filters)) }))));
 

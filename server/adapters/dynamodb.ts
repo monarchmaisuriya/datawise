@@ -1,6 +1,6 @@
 import type { AttributeValue, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import type { Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, WriteOp } from "../../shared/contracts";
-import { finishRows, fromCell } from "../cells";
+import { finishRows, fromCell, positionsOf } from "../cells";
 import { loadDriver } from "../drivers";
 import { errorMessage } from "../errors";
 import { splitStatements } from "../sql-script";
@@ -170,13 +170,13 @@ class DynamoAdapter implements Adapter {
     return { FilterExpression: parts.join(" AND "), ExpressionAttributeNames: names, ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     if (query.sort) throw new Error("DynamoDB tables cannot be sorted by a scan.");
     const { client, sdk } = await this.get();
     const { names, types } = await this.keys(ref.name);
     const result = await client.send(new sdk.ScanCommand({ TableName: ref.name, Limit: query.limit, ExclusiveStartKey: query.cursor ? (JSON.parse(query.cursor) as Item) : undefined, ...this.compile(query.filters) }));
     const { names: columns, rows } = itemsToRows((result.Items ?? []) as Item[], names);
-    const finished = finishRows(rows);
+    const finished = finishRows(rows, null, cellLimit, false, positionsOf(columns, names));
     return {
       columns: columns.map((name) => ({ name, type: types[name] ?? null, nullable: !names.includes(name), defaultValue: null, isKey: names.includes(name), generated: false })),
       keyColumns: names,

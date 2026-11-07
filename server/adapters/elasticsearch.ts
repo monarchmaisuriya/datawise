@@ -1,5 +1,5 @@
 import type { Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
-import { finishRows } from "../cells";
+import { finishRows, positionsOf } from "../cells";
 import { errorMessage } from "../errors";
 import { tlsClientOptions } from "../tls";
 import { httpCall, type HttpTarget } from "../http";
@@ -197,14 +197,14 @@ class ElasticAdapter implements Adapter {
     return { list, rows: flat.map((row) => list.map((name) => (row as Record<string, unknown>)[name] ?? null)) };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     const from = query.cursor === null ? 0 : Number(query.cursor);
     if (!Number.isSafeInteger(from) || from < 0) throw new Error("Invalid page position.");
     const known = (await this.mappingColumns(ref.name)).map((field) => field.name);
     const response = (await this.call("POST", `/${this.index(ref.name)}/_search`, { from, size: query.limit + 1, query: this.compile(query.filters), sort: this.sortClause(query.sort) })) as { hits: { hits: { _id: string; _source?: Record<string, unknown> }[] } };
     const hits = response.hits.hits;
     const { list, rows } = this.hitsToRows(hits.slice(0, query.limit), known);
-    const finished = finishRows(rows);
+    const finished = finishRows(rows, null, cellLimit, false, positionsOf(list, [ID_COLUMN]));
     return {
       columns: list.map((name) => ({ name, type: null, nullable: true, defaultValue: null, isKey: name === ID_COLUMN, generated: name === ID_COLUMN })),
       keyColumns: [ID_COLUMN],

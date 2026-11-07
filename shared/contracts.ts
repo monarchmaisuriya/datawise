@@ -1,9 +1,19 @@
 import { defineAttachmentSource, defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { clampWidth } from "./column-width";
 import { ENGINE_IDS, FILTER_OPS } from "./engines";
 
 // Long and specific, so a real JSON value in a column is never mistaken for bytes.
 export const BYTES_TAG = "$datawise.bytes";
+// Beside BYTES_TAG on a cut binary value: its whole size, since the base64 beside it is only the start.
+export const BYTES_SIZE = "$datawise.size";
+
+// The size of a binary value: the one carried beside a cut value, or what its base64 decodes to.
+export function bytesSize(cell: object): number {
+  const carried = Reflect.get(cell, BYTES_SIZE);
+  if (typeof carried === "number") return carried;
+  return Math.floor((String(Reflect.get(cell, BYTES_TAG)).replace(/=+$/, "").length * 3) / 4);
+}
 
 export const engineId = z.enum(ENGINE_IDS);
 export const safetyMode = z.enum(["read-only", "confirm", "open"]);
@@ -215,6 +225,11 @@ export const savedView = z.object({
   // What is applied now, so a table opens as it was left.
   filtersInUse: z.array(filter).max(20).default([]),
   filters: z.array(savedFilter).default([]),
+  // Widths a person chose, by column name. Read leniently: one bad value must not set every view aside.
+  columnWidths: z
+    .record(z.string(), z.unknown())
+    .default({})
+    .transform((widths): Record<string, number> => Object.fromEntries(Object.entries(widths).flatMap(([name, width]) => (typeof width === "number" && Number.isFinite(width) ? [[name, clampWidth(width)]] : [])))),
 });
 export type SavedView = z.infer<typeof savedView>;
 

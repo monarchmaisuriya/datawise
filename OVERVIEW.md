@@ -13,7 +13,7 @@ PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elast
 - **Queries:** each engine's own language, several statements at a time, with a time limit, stop, history and saved queries. Named tabs per connection keep their drafts. Run the whole text or exactly what is selected. On desktop and web the editor has highlighting and Cmd or Ctrl+Enter, and on SQL databases completion of table and column names. Copy results or a page as a Markdown table.
 - **Files:** open a `.sql` file in a workspace to run it on a connection, and a SQLite file to add it as a connection. Editing stays in Paseo's own editor.
 - **Agents, only if you choose:** attach a table's structure to a prompt, and open a connection to agents at one of three levels: names and types, reading rows, or proposing changes you approve in Datawise.
-- **Preferences:** defaults for page size, query limits, density, how NULL is shown, history, drafts, export and idle close. The screen returns to where you left it.
+- **Preferences:** defaults for page size, query limits, density, text size, value preview length, how NULL, numbers and binary values are shown, history, drafts, export, idle close, and whether to read again when you return to Paseo. The screen returns to where you left it.
 - **Import:** CSV, TSV, JSON and NDJSON, pasted or from a file on the daemon machine, with column mapping.
 - **Export:** CSV, TSV, JSON, NDJSON and SQL inserts, to a file on the daemon machine or the clipboard. An existing file is never replaced.
 

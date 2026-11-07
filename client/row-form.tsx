@@ -5,6 +5,7 @@ import { Text, View } from "react-native";
 import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowKey } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import { jumpFilters } from "../shared/foreign-keys";
+import { wholeKey } from "../shared/row-key";
 import { parseEdited } from "../shared/values";
 import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, PinnedFooter, useApi, useGuardedRun, useUi } from "./kit";
 
@@ -52,6 +53,8 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
     // Only when a different row arrives; typing must not reset the form.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shownRow, shownColumns]);
+
+  const rowKey: RowKey | "changed" | null = mode.kind !== "edit" ? null : !mode.hasCutCells ? mode.key : shownRow ? wholeKey(mode.key, keyColumns, original) : null;
 
   const update = (name: string, patch: Partial<FieldState>) => setFields((current) => ({ ...current, [name]: { ...(current[name] ?? { text: "", isNull: false }), ...patch, touched: true } }));
   const allNames = [...shownColumns.map((column) => column.name), ...extra];
@@ -105,7 +108,8 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
           onClose();
           return;
         }
-        void write({ kind: "update", key: mode.key, changes: values });
+        if (rowKey === null || rowKey === "changed") return;
+        void write({ kind: "update", key: rowKey, changes: values });
       } else void write({ kind: "insert", values });
     } catch (failure) {
       setError(errorText(failure));
@@ -113,7 +117,7 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
   };
 
   const title = editing ? `Row in ${refObject.name}` : `New row in ${refObject.name}`;
-  const editable = editing ? info.canEditRows && keyColumns.length > 0 && canWrite : info.canInsertRows && canWrite;
+  const editable = editing ? info.canEditRows && keyColumns.length > 0 && canWrite && rowKey !== "changed" : info.canInsertRows && canWrite;
   const asObject = () => Object.fromEntries(shownColumns.map((column) => [column.name, original(column.name)]));
   const jumps = editing && shownRow && onJump ? foreignKeys.flatMap((key) => {
     const filters = jumpFilters(key, original);
@@ -123,7 +127,7 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
   const footer = (
     <View style={[ui.row, { justifyContent: "space-between", flexWrap: "wrap" }]}>
       <View style={[ui.row, { gap: 2 }]}>
-        {editing && editable ? <Btn label="Delete" kind="danger" disabled={busy} onPress={() => void write({ kind: "delete", keys: [(mode as { key: RowKey }).key] })} /> : null}
+        {editing && editable ? <Btn label="Delete" kind="danger" disabled={busy} onPress={() => (rowKey === null || rowKey === "changed" ? undefined : void write({ kind: "delete", keys: [rowKey] }))} /> : null}
         {editing && canWrite && info.canInsertRows ? <Btn label="Duplicate" disabled={busy} onPress={() => onDuplicate(asObject())} /> : null}
         {editing ? (
           <Btn
@@ -149,6 +153,7 @@ export function RowForm({ connection, refObject, columns, keyColumns, keyReason,
       <Modal.Content scrollable={false} contentContainerStyle={{ padding: 0, gap: 0 }}>
         <PinnedFooter footer={error ? <><Message kind="error" text={error} />{footer}</> : footer}>
         {editing && keyColumns.length === 0 ? <Message kind="warning" text={keyReason ?? "This row cannot be changed from here."} /> : null}
+        {rowKey === "changed" ? <Message kind="warning" text="This row changed since the page was read, so it cannot be changed from here. Refresh and open it again." /> : null}
         {!canWrite ? <Message kind="note" text="This connection is read-only." /> : null}
         {full.isLoading ? <Message kind="note" text="Loading the whole row…" /> : null}
         {full.error ? <Message kind="error" text={errorText(full.error)} /> : null}

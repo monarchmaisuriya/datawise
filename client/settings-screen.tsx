@@ -4,7 +4,7 @@ import { ScrollView, SettingsAction, SettingsCard, SettingsInput, SettingsSectio
 import { useState } from "react";
 import { Text, View } from "react-native";
 import type { SafetyMode } from "../shared/contracts";
-import { EXPORT_FORMATS, HISTORY_LENGTHS, IDLE_MINUTES, PAGE_SIZES, type Preferences, preferencesDocument, QUERY_LIMITS, TIME_LIMITS_MS } from "../shared/preferences";
+import { EXPORT_FORMATS, HISTORY_LENGTHS, IDLE_MINUTES, PAGE_SIZES, type Preferences, preferencesDocument, PREVIEW_LENGTHS, QUERY_LIMITS, TIME_LIMITS_MS } from "../shared/preferences";
 
 type Ready = Extract<SettingsState<typeof preferencesDocument.schema>, { status: "ready" }>;
 
@@ -28,6 +28,11 @@ function Controls({ settings }: { settings: Ready }) {
         <SettingsCard>
           <SettingsSelect label="Rows per page" value={String(values.rowsPerPage)} options={numbers(PAGE_SIZES, String)} onValueChange={(next) => change({ rowsPerPage: Number(next) })} />
           <SettingsSelect label="Row density" value={values.density} options={[{ value: "comfortable", label: "Comfortable" }, { value: "compact", label: "Compact" }] as const} onValueChange={(density) => change({ density })} />
+          <SettingsSelect label="Text size" hint="For tables and the SQL editor, on every device." value={values.textSize} options={[{ value: "small", label: "Small" }, { value: "medium", label: "Medium" }, { value: "large", label: "Large" }] as const} onValueChange={(textSize) => change({ textSize })} />
+          <SettingsSelect label="Value preview length" hint="Characters of each value shown in a table. Opening a row shows all of it; keys are always whole." value={String(values.cellPreviewChars)} options={numbers(PREVIEW_LENGTHS, (value) => value.toLocaleString())} onValueChange={(next) => change({ cellPreviewChars: Number(next) })} />
+          <SettingsSwitch label="Group digits in numbers" hint="Number columns only. Keys and text are shown as stored." value={values.groupDigits} onValueChange={(groupDigits) => change({ groupDigits })} />
+          <SettingsSelect label="Show binary values as" value={values.binaryDisplay} options={[{ value: "size", label: "Their size" }, { value: "hex", label: "The first 16 bytes in hex" }] as const} onValueChange={(binaryDisplay) => change({ binaryDisplay })} />
+          <SettingsSwitch label="Read again when you return to Paseo" hint="Web and desktop. Off keeps what is shown, with the time it was read, until you refresh or change something." value={values.rereadOnReturn} onValueChange={(rereadOnReturn) => change({ rereadOnReturn })} />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Queries">

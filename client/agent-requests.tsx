@@ -1,6 +1,6 @@
 import { FlatList, ScrollView } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { visibleText, visibleValue } from "../shared/agent-display";
 import type { AgentRequestItem, AgentRequestSummary, RowKey } from "../shared/contracts";
@@ -98,6 +98,15 @@ function RequestDetail({ id, onBack }: { id: string; onBack: () => void }) {
   };
   const request = detail.data?.request;
   const items = detail.data?.items ?? [];
+  // Open tables are not read again on return to Paseo, so an approved change refreshes them when it lands.
+  // Only on that change: opening a request that finished earlier reads nothing.
+  const status = request?.status;
+  const seen = useRef(status);
+  useEffect(() => {
+    const before = seen.current;
+    seen.current = status;
+    if (before !== undefined && before !== status && (status === "done" || status === "unknown")) void client.invalidateQueries({ queryKey: ["datawise", "rows"] });
+  }, [status, client]);
   return (
     <View style={{ gap: 10 }}>
       <View style={{ alignSelf: "flex-start" }}>

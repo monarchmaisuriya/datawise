@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseConnectionUrl } from "../shared/connection-url";
-import { BYTES_TAG } from "../shared/contracts";
+import { BYTES_SIZE, BYTES_TAG } from "../shared/contracts";
 import { inferValue, parseEdited } from "../shared/values";
-import { CELL_LIMIT, finishRows, fromCell, toCell } from "./cells";
+import { CELL_LIMIT, finishRows, fromCell, positionsOf, toCell } from "./cells";
 import { errorMessage, registerSecret, scrubSecrets } from "./errors";
 import { exporterFor, sqlTextFor } from "./formats";
 import { Store, toView } from "./store";
@@ -26,6 +26,19 @@ describe("cells keep their meaning", () => {
     const finished = finishRows([["a", long]]);
     expect(finished.cutCells).toEqual([[0, 1]]);
     expect((finished.rows[0]?.[1] as string).length).toBe(CELL_LIMIT);
+  });
+  it("never cuts a key value, so a row's key always names that row", () => {
+    const long = "k".repeat(CELL_LIMIT + 1);
+    const finished = finishRows([[long, long]], null, CELL_LIMIT, false, positionsOf(["member", "note"], ["member"]));
+    expect(finished.rows[0]?.[0]).toBe(long);
+    expect(finished.cutCells).toEqual([[0, 1]]);
+  });
+  it("cuts binary as binary, keeping its whole size", () => {
+    const finished = finishRows([[new Uint8Array(2048)]], null, 1024);
+    const cell = finished.rows[0]?.[0] as Record<string, unknown>;
+    expect(finished.cutCells).toEqual([[0, 0]]);
+    expect(String(cell[BYTES_TAG]).length).toBe(1024);
+    expect(cell[BYTES_SIZE]).toBe(2048);
   });
   it("cuts at the row limit and says so", () => {
     const finished = finishRows([[1], [2], [3]], 2);

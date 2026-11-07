@@ -2,7 +2,7 @@ import type { Db, Document, MongoClient, MongoClientOptions } from "mongodb";
 import { z } from "zod";
 import { loadDriver } from "../drivers";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
-import { finishRows } from "../cells";
+import { finishRows, positionsOf } from "../cells";
 import { errorMessage } from "../errors";
 import { tlsClientOptions } from "../tls";
 import { PartialRunError, STREAM_BATCH } from "./sql-base";
@@ -311,11 +311,11 @@ class MongoAdapter implements Adapter {
     return sort ? { [sort.column]: sort.descending ? -1 : 1 } : undefined;
   }
 
-  private async pageFromDocs(documents: Document[], limit: number | null, offset: number, fetched: number): Promise<RowPage> {
+  private async pageFromDocs(documents: Document[], limit: number | null, offset: number, fetched: number, cellLimit: number): Promise<RowPage> {
     const { EJSON } = await extendedJson();
     const relaxed = documents.map((document) => EJSON.serialize(document, { relaxed: true }) as Document);
     const names = fieldsOf(relaxed);
-    const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)), limit);
+    const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)), limit, cellLimit, false, positionsOf(names, ["_id"]));
     return {
       columns: names.map((name): ColumnInfo => ({ name, type: null, nullable: true, defaultValue: null, isKey: name === "_id", generated: name === "_id" })),
       keyColumns: ["_id"],
@@ -328,12 +328,12 @@ class MongoAdapter implements Adapter {
     };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     const db = await this.db(ref);
     const offset = query.cursor === null ? 0 : Number(query.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid page position.");
     const documents = await db.collection(ref.name).find(await this.compileFilters(query.filters), { sort: this.toSort(query.sort) }).skip(offset).limit(query.limit + 1).toArray();
-    const page = await this.pageFromDocs(documents, query.limit, offset, documents.length);
+    const page = await this.pageFromDocs(documents, query.limit, offset, documents.length, cellLimit);
     const details = await db.listCollections({ name: ref.name }).toArray();
     if (details[0]?.type === "view") return { ...page, keyColumns: [], keyReason: "A view cannot be edited here." };
     return page;

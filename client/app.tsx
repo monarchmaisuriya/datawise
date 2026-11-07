@@ -1,5 +1,5 @@
 import type { PluginSurfaceProps, PluginTab } from "@getpaseo/plugin/client";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
@@ -9,7 +9,7 @@ import { ConnectionForm, ConnectionList, UnlockPrompt } from "./connections";
 import { DataTab, type JumpTarget } from "./data-tab";
 import { Btn, ConfirmProvider, connectionColorValue, errorText, Pill, Segmented, type Theme, UiProvider, useApi, useConfirm, useUi } from "./kit";
 import { PendingProvider, usePending } from "./pending";
-import { PreferencesProvider } from "./preferences";
+import { PreferencesProvider, usePreferences } from "./preferences";
 import { QueryWorkspace } from "./query-tab";
 import { StructureTab } from "./structure-tab";
 import { ObjectTree, type Place } from "./tree";
@@ -21,10 +21,23 @@ export function DatawiseProviders({ theme, compact, children }: { theme: Theme; 
   return (
     <UiProvider theme={theme} compact={compact}>
       <ConfirmProvider>
-        <PreferencesProvider>{children}</PreferencesProvider>
+        <PreferencesProvider>
+          <ReadPolicy>{children}</ReadPolicy>
+        </PreferencesProvider>
       </ConfirmProvider>
     </UiProvider>
   );
+}
+
+// The host gives each plugin a data cache with default options, where returning to the window reads
+// everything again. Datawise decides that itself: data is read when opened, refreshed, or changed here.
+function ReadPolicy({ children }: { children: ReactNode }) {
+  const client = useQueryClient();
+  const { rereadOnReturn } = usePreferences();
+  const defaults = client.getDefaultOptions();
+  // Set during render, before any query below reads its options. Setting the same value again does nothing.
+  if (defaults.queries?.refetchOnWindowFocus !== rereadOnReturn) client.setDefaultOptions({ ...defaults, queries: { ...defaults.queries, refetchOnWindowFocus: rereadOnReturn } });
+  return children;
 }
 
 export function DatawiseApp(props: PluginSurfaceProps & { workspaceId?: string; tab?: PluginTab }) {

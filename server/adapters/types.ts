@@ -39,7 +39,8 @@ export interface Adapter {
   listSchemas(scope: Scope): Promise<string[]>;
   listObjects(scope: Scope, options: { pattern: string; cursor: string | null }): Promise<ObjectPage>;
   describe(ref: ObjectRef): Promise<ObjectDetails>;
-  read(ref: ObjectRef, query: ReadQuery): Promise<RowPage>;
+  // A page for the grid. Values longer than cellLimit are cut and listed; keys never are.
+  read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage>;
   count(ref: ObjectRef, filters: Filter[]): Promise<number>;
   readRow(ref: ObjectRef, key: RowKey): Promise<RowPage>;
   planWrite(ref: ObjectRef, op: WriteOp): Promise<WritePlan>;

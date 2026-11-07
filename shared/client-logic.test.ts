@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 import { agentRowAccessRefusal, agentRowLevel } from "./agent-access";
 import { visibleText, visibleValue } from "./agent-display";
 import { jumpFilters } from "./foreign-keys";
+import { clampWidth } from "./column-width";
+import { savedView } from "./contracts";
+import { wholeKey } from "./row-key";
+import { columnRange, groupDigits, hexPreview } from "./grid-display";
 import { toMarkdownTable } from "./markdown";
 import { stageCell, stageDelete, toEdits } from "./staging";
 import { dropMissingColumns, visiblePositions } from "./view-columns";
@@ -126,5 +130,52 @@ describe("dialogs", () => {
       return file !== "kit.tsx" && /import \{[^}]*\bModal\b[^}]*\} from "@getpaseo\/plugin\/client\/ui"/.test(source);
     });
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("saved column widths", () => {
+  it("are clamped or dropped one by one, so a bad value never sets every view aside", () => {
+    expect(savedView.parse({ columnWidths: { a: 5000, b: "wide", c: -3, d: 150 } }).columnWidths).toEqual({ a: 800, c: 60, d: 150 });
+    expect(savedView.parse({}).columnWidths).toEqual({});
+  });
+});
+
+describe("grid display", () => {
+  it("draws the columns that overlap the range, and at least one", () => {
+    expect(columnRange([100, 100, 100, 100], 150, 250)).toEqual({ first: 1, last: 2 });
+    expect(columnRange([100, 100, 100], -500, 50)).toEqual({ first: 0, last: 0 });
+    expect(columnRange([100, 100], 900, 1200)).toEqual({ first: 1, last: 1 });
+    expect(columnRange([], 0, 100)).toEqual({ first: 0, last: -1 });
+  });
+  it("clamps a saved width instead of refusing it", () => {
+    expect(clampWidth(5)).toBe(60);
+    expect(clampWidth(5000)).toBe(800);
+    expect(clampWidth(123.6)).toBe(124);
+  });
+  it("groups digits of numbers, and leaves other forms as they are", () => {
+    expect(groupDigits(1234567.25)).toBe("1,234,567.25");
+    expect(groupDigits(-1000)).toBe("-1,000");
+    expect(groupDigits(999)).toBe("999");
+    expect(groupDigits(1e21)).toBe("1e+21");
+  });
+  it("shows the first bytes as hex and says how many there are", () => {
+    expect(hexPreview("AP8=", 2)).toBe("00 ff");
+    expect(hexPreview("AAECAwQFBgcICQoLDA0ODxAR", 18)).toBe("00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f … (18 bytes)");
+    expect(hexPreview("AAEC", 2048)).toBe("00 01 02 … (2048 bytes)");
+  });
+});
+
+describe("a key rebuilt from the whole row", () => {
+  const whole = (values: Record<string, unknown>) => (name: string) => values[name] ?? null;
+  it("keeps a key that arrived whole", () => {
+    expect(wholeKey({ index: 1, value: "a" }, ["index", "value"], whole({ index: 1, value: "a" }))).toEqual({ index: 1, value: "a" });
+  });
+  it("takes the whole value when it starts with what the page showed", () => {
+    expect(wholeKey({ index: 1, value: "LLL" }, ["index", "value"], whole({ index: 1, value: "LLLLLL" }))).toEqual({ index: 1, value: "LLLLLL" });
+  });
+  it("refuses when the row changed since the page was read", () => {
+    expect(wholeKey({ index: 1, value: "LLL" }, ["index", "value"], whole({ index: 1, value: "zzz" }))).toBe("changed");
+    expect(wholeKey({ index: 1, value: "LLL" }, ["index", "value"], whole({ index: 2, value: "LLLLLL" }))).toBe("changed");
+    expect(wholeKey({ index: 1, value: 5 }, ["index", "value"], whole({ index: 1, value: 50 }))).toBe("changed");
   });
 });

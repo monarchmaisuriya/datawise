@@ -3,7 +3,7 @@ import type { Redis, RedisOptions } from "ioredis";
 import { loadDriver } from "../drivers";
 import { tlsClientOptions } from "../tls";
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, WriteOp } from "../../shared/contracts";
-import { finishRows } from "../cells";
+import { finishRows, positionsOf } from "../cells";
 import { errorMessage } from "../errors";
 import { PartialRunError, STREAM_BATCH } from "./sql-base";
 import type { Adapter, AdapterContext, ParsedStatement, RunContext, StreamBatch, StreamSource, WritePlan } from "./types";
@@ -219,15 +219,18 @@ class RedisAdapter implements Adapter {
     };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     const client = await this.client(ref.database);
     const type = await this.typeOf(client, ref.name);
     const shape = this.shape(type);
     const page = await this.readPage(client, ref.name, type, query.limit, query.cursor, query.filters);
-    const finished = finishRows(page.rows);
+    const keyColumns = shape.key.length > 0 ? shape.key : ["value"];
+    // A value only checks that a list entry has not moved. It is not an identity, so it is cut like any value,
+    // and the row form reads it whole before a write.
+    const finished = finishRows(page.rows, null, cellLimit, false, positionsOf(shape.columns, shape.key.filter((name) => name !== "value")));
     return {
       columns: shape.columns.map((name) => column(name, shape.key.includes(name))),
-      keyColumns: shape.key.length > 0 ? shape.key : ["value"],
+      keyColumns,
       keyReason: null,
       rows: finished.rows,
       cutCells: finished.cutCells,

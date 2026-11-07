@@ -4,7 +4,9 @@ import { type RefObject, useEffect, useRef } from "react";
 import { Platform, View } from "react-native";
 import type { ConnectionView, Scope } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
+import { TEXT_SIZES } from "../shared/preferences";
 import { type Api, MONO, useApi, useUi } from "./kit";
+import { usePreferences } from "./preferences";
 import { COMPLETION_ENGINES, mountSqlEditor, type SqlEditorHandle } from "./web";
 
 const DESCRIBE_LIMIT = 10;
@@ -52,6 +54,7 @@ export function SqlEditor({ control, connection, scope, text, onChangeText, onSe
   latest.current = { onChangeText, onSelection, onRun };
   const schema = useCompletionSchema(api, connection, scope, text, web && active && !readOnly && COMPLETION_ENGINES.includes(connection.engine));
   const schemaKey = schema ? JSON.stringify(schema) : "";
+  const fontSize = TEXT_SIZES[usePreferences().textSize];
 
   useEffect(() => {
     if (!web) return;
@@ -61,6 +64,7 @@ export function SqlEditor({ control, connection, scope, text, onChangeText, onSe
       engine: connection.engine,
       label: info.queryPlaceholder,
       readOnly,
+      fontSize,
       onChange(next) {
         textNow.current = next;
         latest.current.onChangeText(next);
@@ -75,7 +79,7 @@ export function SqlEditor({ control, connection, scope, text, onChangeText, onSe
       editor.current = null;
     };
     // The editor keeps its own text and undo history, so only these rebuild it.
-  }, [web, ui.theme, connection.engine, info.queryPlaceholder, readOnly]);
+  }, [web, ui.theme, connection.engine, info.queryPlaceholder, readOnly, fontSize]);
 
   useEffect(() => {
     if (text !== textNow.current) {
@@ -129,7 +133,7 @@ export function SqlEditor({ control, connection, scope, text, onChangeText, onSe
       autoCapitalize="none"
       autoCorrect={false}
       spellCheck={false}
-      style={[ui.input, { fontFamily: MONO, fontSize: 12, height, textAlignVertical: "top" }]}
+      style={[ui.input, { fontFamily: MONO, fontSize, height, textAlignVertical: "top" }]}
     />
   );
 }

@@ -21,6 +21,7 @@ export interface SqlEditorOptions {
   engine: EngineId;
   label: string;
   readOnly: boolean;
+  fontSize: number;
   onChange: (text: string) => void;
   onSelection: (selected: string) => void;
   onRun: () => void;
@@ -79,7 +80,7 @@ export function mountSqlEditor(parent: unknown, options: SqlEditorOptions): SqlE
         placeholder(options.label),
         View.contentAttributes.of({ "aria-label": options.label, autocapitalize: "off", autocorrect: "off", spellcheck: "false" }),
         View.theme({
-          "&": { height: "100%", color: c.foreground, backgroundColor: c.surface1, fontSize: "12px" },
+          "&": { height: "100%", color: c.foreground, backgroundColor: c.surface1, fontSize: `${options.fontSize}px` },
           "&.cm-focused": { outline: "none" },
           ".cm-scroller": { overflow: "auto", fontFamily: "ui-monospace, Menlo, Consolas, monospace" },
           ".cm-content": { caretColor: c.foreground },

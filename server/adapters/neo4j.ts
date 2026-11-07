@@ -1,6 +1,6 @@
 import type { Driver, Session } from "neo4j-driver";
 import type { Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, WriteOp } from "../../shared/contracts";
-import { finishRows } from "../cells";
+import { finishRows, positionsOf } from "../cells";
 import { loadDriver } from "../drivers";
 import { errorMessage } from "../errors";
 import { splitStatements } from "../sql-script";
@@ -212,14 +212,14 @@ class Neo4jAdapter implements Adapter {
     return { names, rows: flat.map((row) => names.map((name) => row[name] ?? null)) };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     const skip = query.cursor === null ? 0 : Number(query.cursor);
     if (!Number.isSafeInteger(skip) || skip < 0) throw new Error("Invalid page position.");
     return this.withSession(ref.database, "READ", async (session, neo4j) => {
       const where = this.where(query.filters);
       const result = await session.run(`MATCH (n:${quoteLabel(ref.name)})${where.sql} RETURN n${this.order(query.sort)} SKIP $skip LIMIT $limit`, { ...where.params, skip: neo4j.int(skip), limit: neo4j.int(query.limit + 1) });
       const { names, rows } = this.rowsOf(result.records.slice(0, query.limit), neo4j);
-      const finished = finishRows(rows);
+      const finished = finishRows(rows, null, cellLimit, false, positionsOf(names, [ID_COLUMN]));
       return {
         columns: names.map((name) => ({ name, type: null, nullable: true, defaultValue: null, isKey: name === ID_COLUMN, generated: name === ID_COLUMN })),
         keyColumns: [ID_COLUMN],

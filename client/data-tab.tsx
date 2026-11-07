@@ -5,11 +5,12 @@ import { Text, View } from "react-native";
 import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowKey, RowPage, SavedFilter, SavedView, Sort } from "../shared/contracts";
 import { ENGINES, FILTER_LABELS, type FilterOp } from "../shared/engines";
 import { toMarkdownTable } from "../shared/markdown";
-import { PAGE_SIZES } from "../shared/preferences";
+import { PAGE_SIZES, TEXT_SIZES } from "../shared/preferences";
+import { clampWidth } from "../shared/column-width";
 import { rowId, toEdits } from "../shared/staging";
 import { parseEdited } from "../shared/values";
 import { dropMissingColumns, visiblePositions } from "../shared/view-columns";
-import { Grid } from "./grid";
+import { autoWidths, Grid, usePointerResize } from "./grid";
 import { Btn, cellText, Chip, errorText, Field, isBytes, Message, Modal, MoreMenu, Section, Select, useApi, useConfirm, useGuardedRun, useUi, waitForJob } from "./kit";
 import { usePending } from "./pending";
 import { usePreferences } from "./preferences";
@@ -20,12 +21,26 @@ function keyOf(page: RowPage, row: unknown[]): RowKey {
   return Object.fromEntries(page.keyColumns.map((name) => [name, row[page.columns.findIndex((column) => column.name === name)]]));
 }
 
+// The server keeps keys whole, except a Redis value that takes part in its key. A cut key names a different row,
+// so selecting and editing cells refuse it. Opening the row works: the row form rebuilds the key from the whole row.
+const KEY_CUT = "This row's key is too long to select or edit here. Open the row to change it.";
+function keyIsCut(page: RowPage, index: number): boolean {
+  return page.cutCells.some(([rowIndex, position]) => rowIndex === index && page.keyColumns.includes(page.columns[position]?.name ?? ""));
+}
+
+// The time alone for today, so a page left open overnight never looks freshly read.
+function readTime(at: number): string {
+  const when = new Date(at);
+  const time = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return when.toDateString() === new Date().toDateString() ? time : `${when.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+}
+
 export interface JumpTarget {
   key: ObjectDetails["foreignKeys"][number];
   filters: Filter[];
 }
 
-const NO_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [] };
+const NO_VIEW: SavedView = { hiddenColumns: [], columnOrder: [], sort: null, filtersInUse: [], filters: [], columnWidths: {} };
 
 // Loads the saved view and, on catalog engines, the table's columns before the first read, so a stale view
 // can be corrected before it can stop the table opening.
@@ -69,6 +84,18 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   const [hiddenColumns, setHiddenColumns] = useState(saved.hiddenColumns);
   const [columnOrder, setColumnOrder] = useState(saved.columnOrder);
   const [savedFilters, setSavedFilters] = useState(saved.filters);
+  const [columnWidths, setColumnWidths] = useState(saved.columnWidths);
+  const pointerResize = usePointerResize();
+  const widthOf = (name: string) => {
+    const saved = columnWidths[name];
+    const position = data?.columns.findIndex((column) => column.name === name) ?? -1;
+    return saved !== undefined ? { width: saved, saved: true } : { width: Math.round(automatic[position] ?? 0), saved: false };
+  };
+  const resizeColumn = (name: string, width: number | null) =>
+    setColumnWidths((current) => {
+      const { [name]: _, ...rest } = current;
+      return width === null ? rest : { ...rest, [name]: width };
+    });
   // By key, not by position: a refresh can move rows, and a position would then name a different row.
   const [selected, setSelected] = useState<ReadonlyMap<string, { key: RowKey; seen: Record<string, unknown> }>>(new Map());
   const [form, setForm] = useState<RowFormMode | null>(null);
@@ -90,10 +117,10 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   // Saved when it changes, and not on opening. A jump's filter is for this visit, so the saved one stays.
   const viewNow: SavedView = useMemo(() => {
     const fromJump = initialFilters !== undefined && JSON.stringify(filters) === JSON.stringify(initialFilters);
-    return { hiddenColumns, columnOrder, sort, filtersInUse: fromJump ? saved.filtersInUse : filters, filters: savedFilters };
+    return { hiddenColumns, columnOrder, sort, filtersInUse: fromJump ? saved.filtersInUse : filters, filters: savedFilters, columnWidths };
     // saved and initialFilters are what the table opened with, and do not change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hiddenColumns, columnOrder, sort, filters, savedFilters]);
+  }, [hiddenColumns, columnOrder, sort, filters, savedFilters, columnWidths]);
   const firstView = useRef(true);
   useEffect(() => {
     if (firstView.current) {
@@ -108,7 +135,8 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   }, [viewNow]);
 
   const cursor = cursors[cursors.length - 1] ?? null;
-  const queryKey = ["datawise", "rows", refObject, limit, cursor, sort, filters];
+  // The preview length is in the key, so changing it reads the page again.
+  const queryKey = ["datawise", "rows", refObject, limit, cursor, sort, filters, preferences.cellPreviewChars];
   const page = useQuery({ queryKey, queryFn: () => api.readRows({ ref: refObject, query: { limit, cursor, sort, filters } }), retry: false });
   const data = page.data;
   // Kept after a failure, so a filter that the database refused can still be opened and corrected.
@@ -140,6 +168,8 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
     });
     return { rows, editedCells, deletedRows };
   }, [data, staged, names]);
+  // Measured from the rows the grid draws, pending edits included, so the dialog shows the width on screen.
+  const automatic = useMemo(() => (data ? autoWidths(data.columns, overlay.rows, TEXT_SIZES[preferences.textSize]) : []), [data, overlay.rows, preferences.textSize]);
 
   const resetPaging = () => {
     setCursors([null]);
@@ -158,6 +188,10 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   const toggle = (index: number) => {
     const row = data?.rows[index];
     if (!data || !row) return;
+    if (keyIsCut(data, index)) {
+      setActionError(KEY_CUT);
+      return;
+    }
     const key = keyOf(data, row);
     const id = JSON.stringify(key);
     // Whole values only. A cut one is not what is stored, so it could never compare equal.
@@ -238,6 +272,10 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
     const row = data?.rows[index];
     const column = data?.columns[position];
     if (!data || !row || !column) return;
+    if (keyIsCut(data, index)) {
+      setActionError(KEY_CUT);
+      return;
+    }
     const cut = data.cutCells.some(([rowIndex, cutPosition]) => rowIndex === index && cutPosition === position);
     // These cannot be edited in place: a cut value is not whole, and a key must not change with others pending.
     if (cut || isBytes(row[position]) || column.generated) {
@@ -315,6 +353,8 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
           visible={visible}
           editedCells={overlay.editedCells}
           deletedRows={overlay.deletedRows}
+          savedWidths={columnWidths}
+          onResize={resizeColumn}
           sort={sort}
           onSort={info.canSort ? toggleSort : undefined}
           selected={canSelect && checking ? selectedIndexes : undefined}
@@ -332,6 +372,7 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
         <Text style={[ui.muted, { flexShrink: 1 }]}>
           {rowsLabel}
           {count ? ` · ${count}` : ""}
+          {data ? ` · Read ${readTime(page.dataUpdatedAt)}` : ""}
         </Text>
         <View style={ui.row}>
           <Select
@@ -423,6 +464,8 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
           hidden={hiddenColumns}
           visible={visible}
           onClose={() => setColumnsOpen(false)}
+          widthOf={!pointerResize && data ? (name) => widthOf(name) : undefined}
+          onResize={pointerResize ? undefined : resizeColumn}
           onChange={(nextHidden, nextOrder) => {
             setHiddenColumns(nextHidden);
             setColumnOrder(nextOrder);
@@ -473,7 +516,10 @@ function CellModal({ column, stored, current, schemaless, onClose, onStage }: { 
   );
 }
 
-function ColumnsModal({ names, hidden, visible, onClose, onChange }: { names: string[]; hidden: string[]; visible: number[]; onClose: () => void; onChange: (hidden: string[], order: string[]) => void }) {
+const WIDTH_STEP = 40;
+
+// widthOf and onResize are given on phones, where a header edge cannot be dragged.
+function ColumnsModal({ names, hidden, visible, onClose, onChange, widthOf, onResize }: { names: string[]; hidden: string[]; visible: number[]; onClose: () => void; onChange: (hidden: string[], order: string[]) => void; widthOf?: (name: string) => { width: number; saved: boolean }; onResize?: (name: string, width: number | null) => void }) {
   const ui = useUi();
   // Hidden columns stay in the list at the end, so they can be brought back.
   const shown = visible.map((position) => names[position] as string);
@@ -492,16 +538,30 @@ function ColumnsModal({ names, hidden, visible, onClose, onChange }: { names: st
       <Modal.Content>
         {order.map((name) => {
           const isHidden = hidden.includes(name);
+          const size = widthOf?.(name);
           return (
-            <View key={name} style={[ui.row, { justifyContent: "space-between" }]}>
-              <Text numberOfLines={1} style={[ui.mono, { flexShrink: 1, opacity: isHidden ? 0.5 : 1 }]}>
-                {name}
-              </Text>
-              <View style={ui.row}>
-                <Btn icon="ArrowUp" title={`Move ${name} up`} onPress={() => move(name, -1)} />
-                <Btn icon="ArrowDown" title={`Move ${name} down`} onPress={() => move(name, 1)} />
-                <Chip label={isHidden ? "Hidden" : "Shown"} on={!isHidden} disabled={!isHidden && shown.length === 1} onPress={() => onChange(isHidden ? hidden.filter((item) => item !== name) : [...hidden, name], order)} />
+            <View key={name} style={{ gap: 2 }}>
+              <View style={[ui.row, { justifyContent: "space-between" }]}>
+                <Text numberOfLines={1} style={[ui.mono, { flexShrink: 1, opacity: isHidden ? 0.5 : 1 }]}>
+                  {name}
+                </Text>
+                <View style={ui.row}>
+                  <Btn icon="ArrowUp" title={`Move ${name} up`} onPress={() => move(name, -1)} />
+                  <Btn icon="ArrowDown" title={`Move ${name} down`} onPress={() => move(name, 1)} />
+                  <Chip label={isHidden ? "Hidden" : "Shown"} on={!isHidden} disabled={!isHidden && shown.length === 1} onPress={() => onChange(isHidden ? hidden.filter((item) => item !== name) : [...hidden, name], order)} />
+                </View>
               </View>
+              {size && onResize ? (
+                <View style={[ui.row, { gap: 2 }]}>
+                  <Text style={[ui.muted, { flex: 1 }]}>
+                    Width {size.width}
+                    {size.saved ? "" : ", automatic"}
+                  </Text>
+                  <Btn icon="Minus" title={`Narrower ${name}`} onPress={() => onResize(name, clampWidth(size.width - WIDTH_STEP))} />
+                  <Btn icon="Plus" title={`Wider ${name}`} onPress={() => onResize(name, clampWidth(size.width + WIDTH_STEP))} />
+                  <Btn label="Automatic" disabled={!size.saved} onPress={() => onResize(name, null)} />
+                </View>
+              ) : null}
             </View>
           );
         })}

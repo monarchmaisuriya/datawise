@@ -5,7 +5,7 @@ import { createContext, type ReactNode, useCallback, useContext, useMemo, useRef
 import { Platform, Pressable, Text, View } from "react-native";
 import { PendingContext } from "./pending";
 import { PreferencesContext } from "./preferences";
-import { BYTES_TAG, type ConnectionColor, type JobView, rpc, type StartResult } from "../shared/contracts";
+import { BYTES_TAG, bytesSize, type ConnectionColor, type JobView, rpc, type StartResult } from "../shared/contracts";
 
 export type Theme = PluginSurfaceProps["theme"];
 export const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "ui-monospace, Menlo, Consolas, monospace" });
@@ -135,7 +135,7 @@ export function cellText(cell: unknown): string {
   if (cell === null || cell === undefined) return "";
   if (typeof cell === "string") return cell;
   if (typeof cell === "object") {
-    if (isBytes(cell)) return `<${Math.floor((String(Reflect.get(cell, BYTES_TAG)).length * 3) / 4)} bytes>`;
+    if (isBytes(cell)) return `<${bytesSize(cell)} bytes>`;
     return JSON.stringify(cell);
   }
   return String(cell);

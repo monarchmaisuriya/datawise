@@ -1,5 +1,5 @@
 import type { ColumnInfo, Filter, ObjectDetails, ObjectPage, ObjectRef, QueryResult, ReadQuery, RowKey, RowPage, Scope, Sort, StagedEdit, WriteOp } from "../../shared/contracts";
-import { finishRows, fromCell } from "../cells";
+import { finishRows, fromCell, positionsOf } from "../cells";
 import { errorMessage } from "../errors";
 import { splitStatements, type SqlDialect } from "../sql-script";
 import { type Adapter, type ParsedStatement, requireKey, type RunContext, type StreamBatch, type StreamSource, type WritePlan } from "./types";
@@ -244,14 +244,14 @@ export class SqlAdapter implements Adapter {
     }
   }
 
-  async read(ref: ObjectRef, query: ReadQuery): Promise<RowPage> {
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
     const details = await this.cachedDescribe(ref);
     const where = buildWhere(this.rules, query.filters, details.columns);
     const offset = parseOffset(query.cursor);
     // One extra row says whether a next page exists without a count.
     const sql = this.rules.page(`SELECT ${this.projection(details)} FROM ${this.rules.table(ref)}${where.sql}`, orderClause(this.rules, this.rules.table(ref), query.sort, details), query.limit + 1, offset);
     const result = await this.withPooled(ref, (session) => this.fetch(session, sql, where.params, query.limit + 1));
-    const finished = finishRows(result.rows, query.limit);
+    const finished = finishRows(result.rows, query.limit, cellLimit, false, positionsOf(result.columns.map((column) => column.name), details.keyColumns));
     const cutForSize = finished.rows.length < Math.min(result.rows.length, query.limit);
     return {
       columns: mergeColumns(result.columns, details),
@@ -287,7 +287,7 @@ export class SqlAdapter implements Adapter {
     const offset = parseOffset(query.cursor);
     const sql = this.rules.page(`SELECT ${this.projection(details)} FROM ${this.rules.table(ref)}${where.sql}`, orderClause(this.rules, this.rules.table(ref), query.sort, details), query.limit + 1, offset);
     const result = await this.isolated(ref, (session) => this.fetch(session, sql, where.params, query.limit + 1));
-    const finished = finishRows(result.rows, query.limit, cellLimit, true);
+    const finished = finishRows(result.rows, query.limit, cellLimit, true, positionsOf(result.columns.map((column) => column.name), details.keyColumns));
     const cutForSize = finished.rows.length < Math.min(result.rows.length, query.limit);
     return {
       columns: mergeColumns(result.columns, details),
