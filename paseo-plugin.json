@@ -4,6 +4,6 @@
   "icon": "datawise.png",
   "media": ["assets/data.jpg", "assets/query.jpg"],
   "description": "A database client for Paseo: browse, query, edit, import and export PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j.",
-  "requirements": { "paseo": ">=0.15.1" },
+  "requirements": { "paseo": ">=0.16.0-beta.2" },
   "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
 }

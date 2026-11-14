@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { z } from "zod";
 import { agentAccess, agentRowAccess, connectionColor, type ConnectionView, connectionInput, environmentLabel, type HistoryEntry, historyEntry, type SavedQuery, safetyMode, savedQuery, sshInput, tlsMode, engineId } from "../shared/contracts";
 import { agentRowAccessRefusal } from "../shared/agent-access";
-import { ENGINES } from "../shared/engines";
 import { registerSecret } from "./errors";
 
 const storedConnection = z.object({
@@ -166,7 +165,6 @@ export class Store {
     if (input.environment === "production" && input.safety === "open") throw new Error("A production connection cannot run without prompts. Choose Ask first or Read-only.");
     if (input.agentAccess !== "none") {
       if (input.environment === "production") throw new Error("A production connection cannot be shared with agents.");
-      if (!ENGINES[input.engine].catalogSchema) throw new Error(`${ENGINES[input.engine].label} structure comes from the data itself, so it cannot be shared with agents without sharing data.`);
     }
     const refusal = agentRowAccessRefusal(input);
     if (refusal) throw new Error(refusal);

@@ -197,14 +197,19 @@ class ElasticAdapter implements Adapter {
     return { list, rows: flat.map((row) => list.map((name) => (row as Record<string, unknown>)[name] ?? null)) };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+  // An agent's read. Datawise builds this query itself, so no agent-written text reaches the database.
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    return this.read(ref, query, cellLimit, true);
+  }
+
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number, bytesAsSize = false): Promise<RowPage> {
     const from = query.cursor === null ? 0 : Number(query.cursor);
     if (!Number.isSafeInteger(from) || from < 0) throw new Error("Invalid page position.");
     const known = (await this.mappingColumns(ref.name)).map((field) => field.name);
     const response = (await this.call("POST", `/${this.index(ref.name)}/_search`, { from, size: query.limit + 1, query: this.compile(query.filters), sort: this.sortClause(query.sort) })) as { hits: { hits: { _id: string; _source?: Record<string, unknown> }[] } };
     const hits = response.hits.hits;
     const { list, rows } = this.hitsToRows(hits.slice(0, query.limit), known);
-    const finished = finishRows(rows, null, cellLimit, false, positionsOf(list, [ID_COLUMN]));
+    const finished = finishRows(rows, null, cellLimit, bytesAsSize, positionsOf(list, [ID_COLUMN]));
     return {
       columns: list.map((name) => ({ name, type: null, nullable: true, defaultValue: null, isKey: name === ID_COLUMN, generated: name === ID_COLUMN })),
       keyColumns: [ID_COLUMN],
@@ -216,8 +221,8 @@ class ElasticAdapter implements Adapter {
     };
   }
 
-  async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
-    const response = (await this.call("POST", `/${this.index(ref.name)}/_count`, { query: this.compile(filters) })) as { count: number };
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
+    const response = (await this.call("POST", `/${this.index(ref.name)}/_count`, { query: this.compile(filters) }, { timeoutMs })) as { count: number };
     return response.count;
   }
 
@@ -298,7 +303,7 @@ class ElasticAdapter implements Adapter {
         const bulk = /\/_bulk\b|\/_msearch\b/.test(request.path);
         const body = bulk && request.body ? `${request.body}\n` : request.body;
         const response = await this.call(request.method, request.path, body, { signal: context.signal, timeoutMs: context.timeoutMs, contentType: bulk ? "application/x-ndjson" : "application/json" });
-        results.push(this.responseToResult(statement.text, response, Date.now() - started, context.limit));
+        results.push(this.responseToResult(statement.text, response, Date.now() - started, context));
       } catch (error) {
         throw new PartialRunError(errorMessage(error), results);
       }
@@ -306,20 +311,20 @@ class ElasticAdapter implements Adapter {
     return results;
   }
 
-  private responseToResult(statement: string, response: unknown, durationMs: number, limit: number): QueryResult {
+  private responseToResult(statement: string, response: unknown, durationMs: number, { limit, cellLimit, bytesAsSize }: RunContext): QueryResult {
     const hits = (response as { hits?: { hits?: { _id: string; _source?: Record<string, unknown> }[] } }).hits?.hits;
     const blank = { nullable: null, defaultValue: null, isKey: false, generated: false, type: null };
     if (hits) {
       const { list, rows } = this.hitsToRows(hits, []);
-      const finished = finishRows(rows, limit);
+      const finished = finishRows(rows, limit, cellLimit, bytesAsSize);
       return { statement, columns: list.map((name) => ({ ...blank, name })), rows: finished.rows, cutCells: finished.cutCells, truncated: finished.truncated, affected: null, durationMs, message: null };
     }
     if (Array.isArray(response) && response.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
       const names = [...new Set(response.flatMap((item) => Object.keys(item as object)))];
-      const finished = finishRows(response.map((item) => names.map((name) => (item as Record<string, unknown>)[name] ?? null)), limit);
+      const finished = finishRows(response.map((item) => names.map((name) => (item as Record<string, unknown>)[name] ?? null)), limit, cellLimit, bytesAsSize);
       return { statement, columns: names.map((name) => ({ ...blank, name })), rows: finished.rows, cutCells: finished.cutCells, truncated: finished.truncated, affected: null, durationMs, message: null };
     }
-    const finished = finishRows([[response]]);
+    const finished = finishRows([[response]], null, cellLimit, bytesAsSize);
     return { statement, columns: [{ ...blank, name: "response" }], rows: finished.rows, cutCells: finished.cutCells, truncated: false, affected: null, durationMs, message: null };
   }
 

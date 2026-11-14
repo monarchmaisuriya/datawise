@@ -12,6 +12,10 @@ function rowsText(count: number): string {
   return `${count} row${count === 1 ? "" : "s"}`;
 }
 
+function sizeText(request: AgentRequestSummary): string {
+  return request.unit === "statements" ? `run ${request.rows} statement${request.rows === 1 ? "" : "s"}` : `change ${rowsText(request.rows)}`;
+}
+
 export function usePendingAgentRequests() {
   const api = useApi();
   const list = useQuery({ queryKey: ["datawise", "agent-requests"], queryFn: () => api.listAgentRequests({}), refetchInterval: POLL_MS, retry: false });
@@ -41,6 +45,16 @@ function ItemCard({ item }: { item: AgentRequestItem }) {
             {visibleText(name)} = {visibleValue(value)}
           </Text>
         ))}
+      </View>
+    );
+  }
+  if (item.kind === "statement") {
+    return (
+      <View style={ui.card}>
+        <Text style={ui.label}>Run this statement</Text>
+        <Text selectable style={ui.mono}>
+          {visibleText(item.text)}
+        </Text>
       </View>
     );
   }
@@ -115,7 +129,7 @@ function RequestDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {detail.error ? <Message kind="error" text={errorText(detail.error)} /> : null}
       {request ? (
         <>
-          <Text style={ui.title}>{visibleText(request.agentTitle ?? "An agent")} wants to change {rowsText(request.rows)}</Text>
+          <Text style={ui.title}>{visibleText(request.agentTitle ?? "An agent")} wants to {sizeText(request)}</Text>
           <Text selectable style={ui.muted}>
             Agent {visibleText(request.agentId)}
           </Text>
@@ -134,7 +148,7 @@ function RequestDetail({ id, onBack }: { id: string; onBack: () => void }) {
               <Btn label={busy ? "Working…" : "Approve"} kind="primary" disabled={busy} onPress={() => void decide(true)} />
             </View>
           ) : (
-            <Message kind={request.status === "done" ? "success" : request.status === "unknown" ? "warning" : "note"} text={request.status === "unknown" ? "Datawise lost the database's answer while committing, so this may or may not have landed. Check the table." : `This request is ${request.status}${request.status === "done" ? `: ${rowsText(request.affected ?? 0)} changed` : ""}.`} />
+            <Message kind={request.status === "done" ? "success" : request.status === "unknown" || request.status === "partial" ? "warning" : "note"} text={request.status === "partial" ? "Some statements ran before one failed, and those stay applied. Check the data." : request.status === "unknown" ? "Datawise lost the database's answer while committing, so this may or may not have landed. Check the table." : `This request is ${request.status}${request.status === "done" ? `: ${rowsText(request.affected ?? 0)} changed` : ""}.`} />
           )}
         </>
       ) : null}
@@ -147,7 +161,7 @@ function RequestRow({ request, onOpen }: { request: AgentRequestSummary; onOpen:
   return (
     <Pressable accessibilityRole="button" accessibilityLabel={`Open request from ${request.agentTitle ?? "an agent"}`} onPress={onOpen} style={[ui.card, { gap: 2 }]}>
       <Text numberOfLines={1} style={ui.body}>
-        {visibleText(request.agentTitle ?? "An agent")}: {rowsText(request.rows)}, {visibleText(request.place)}
+        {visibleText(request.agentTitle ?? "An agent")}: {request.unit === "statements" ? `${request.rows} statement${request.rows === 1 ? "" : "s"}` : rowsText(request.rows)}, {visibleText(request.place)}
       </Text>
       <Text numberOfLines={1} style={request.status === "pending" ? ui.warning : ui.muted}>
         {visibleText(request.connectionName)}, {request.status}
@@ -188,7 +202,7 @@ export function AgentRequestsModal({ onClose }: { onClose: () => void }) {
                 keyExtractor={(event, index) => `${event.at}-${index}`}
                 renderItem={({ item: event }) => (
                   <Text numberOfLines={2} style={[ui.muted, { paddingVertical: 2 }]}>
-                    {new Date(event.at).toLocaleString()} · {visibleText(event.agentTitle ?? event.agentId)} · {event.action} · {rowsText(event.rows)} · {visibleText(event.connectionName)} · {visibleText(event.place)}
+                    {new Date(event.at).toLocaleString()} · {visibleText(event.agentTitle ?? event.agentId)} · {event.action} · {event.unit === "statements" ? `${event.rows} statement${event.rows === 1 ? "" : "s"}` : rowsText(event.rows)} · {visibleText(event.connectionName)} · {visibleText(event.place)}
                   </Text>
                 )}
               />

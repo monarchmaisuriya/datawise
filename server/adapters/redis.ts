@@ -219,7 +219,12 @@ class RedisAdapter implements Adapter {
     };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+  // An agent's read. Datawise builds this query itself, so no agent-written text reaches the database.
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    return this.read(ref, query, cellLimit, true);
+  }
+
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number, bytesAsSize = false): Promise<RowPage> {
     const client = await this.client(ref.database);
     const type = await this.typeOf(client, ref.name);
     const shape = this.shape(type);
@@ -227,7 +232,7 @@ class RedisAdapter implements Adapter {
     const keyColumns = shape.key.length > 0 ? shape.key : ["value"];
     // A value only checks that a list entry has not moved. It is not an identity, so it is cut like any value,
     // and the row form reads it whole before a write.
-    const finished = finishRows(page.rows, null, cellLimit, false, positionsOf(shape.columns, shape.key.filter((name) => name !== "value")));
+    const finished = finishRows(page.rows, null, cellLimit, bytesAsSize, positionsOf(shape.columns, shape.key.filter((name) => name !== "value")));
     return {
       columns: shape.columns.map((name) => column(name, shape.key.includes(name))),
       keyColumns,
@@ -285,11 +290,22 @@ class RedisAdapter implements Adapter {
     }
   }
 
-  async count(ref: ObjectRef): Promise<number> {
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
     const client = await this.client(ref.database);
     const type = await this.typeOf(client, ref.name);
     const lengths: Record<string, () => Promise<number>> = { hash: () => client.hlen(ref.name), list: () => client.llen(ref.name), set: () => client.scard(ref.name), zset: () => client.zcard(ref.name), stream: () => client.xlen(ref.name) };
-    return lengths[type]?.() ?? 1;
+    if (filters.length === 0) return lengths[type]?.() ?? 1;
+    // A filter matches entry by entry, so the entries are read, as a page of rows reads them, until the deadline.
+    const deadline = Date.now() + timeoutMs;
+    let total = 0;
+    let cursor: string | null = null;
+    do {
+      if (Date.now() > deadline) throw new Error(`Counting took longer than ${timeoutMs / 1000} seconds.`);
+      const page = await this.readPage(client, ref.name, type, 1000, cursor, filters);
+      total += page.rows.length;
+      cursor = page.nextCursor;
+    } while (cursor);
+    return total;
   }
 
   async readRow(ref: ObjectRef, key: RowKey): Promise<RowPage> {
@@ -509,7 +525,7 @@ class RedisAdapter implements Adapter {
       try {
         const reply: unknown = await client.call(command, ...args);
         const list = Array.isArray(reply) ? reply : [reply];
-        const finished = finishRows(list.map((item) => [Array.isArray(item) ? item : item]), context.limit);
+        const finished = finishRows(list.map((item) => [Array.isArray(item) ? item : item]), context.limit, context.cellLimit, context.bytesAsSize);
         results.push({ statement: statement.text, columns: [RESULT_COLUMN], rows: finished.rows, cutCells: finished.cutCells, truncated: finished.truncated, affected: null, durationMs: Date.now() - started, message: null });
       } catch (error) {
         throw new PartialRunError(errorMessage(error), results);

@@ -5,13 +5,14 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { inferValue } from "../shared/values";
 import { open as openFile } from "node:fs/promises";
-import { agentActivityEvent, type AgentActivityEvent, type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult } from "../shared/contracts";
+import { agentActivityEvent, type AgentActivityEvent, type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult, type AgentOpenEvent, subscriptions } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import type { Adapter, StreamSource, WritePlan } from "./adapters/types";
 import { agentRowLevel } from "../shared/agent-access";
 import { AgentRequests } from "./agent-requests";
-import { type ActivityLog, agentMayRead, agentTarget, createAgentTools } from "./agent-tool";
-import { CommitUnknown } from "./adapters/sql-base";
+import { type ActivityLog, agentTarget, createAgentTools, type OpenInTab, PROPOSED_RUN_MS } from "./agent-tool";
+import { CommitUnknown, PartialRunError } from "./adapters/sql-base";
+import { CELL_LIMIT } from "./cells";
 import { dataFolder } from "./paseo-home";
 import { errorMessage, guard } from "./errors";
 import { exporterFor, openOutput, readRecords, sqlTextFor, writeChunk } from "./formats";
@@ -94,9 +95,6 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   });
   void preferences.get().then((values) => pool.setIdleCloseMinutes(values.idleCloseMinutes));
 
-  // Declaring this hook makes every open agent session reopen, even if the handler changes nothing, so it
-  // exists only while a connection is shared. The handler does no work, because one that throws would stop
-  // every agent on the daemon from opening a session.
   // A save still on its way when a connection is deleted must not bring back what the delete removed.
   const connectionExists = async (id: string) => (await store.listConnections()).some((item) => item.id === id);
 
@@ -110,24 +108,36 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
       })
       .catch(onStray);
   };
-  const requests = new AgentRequests((request) => record({ agentId: request.agentId, agentTitle: request.agentTitle, connectionId: request.connectionId, connectionName: request.connectionName, action: "expired", place: request.place, rows: request.rows }));
+  const requests = new AgentRequests((request) => record({ agentId: request.agentId, agentTitle: request.agentTitle, connectionId: request.connectionId, connectionName: request.connectionName, action: "expired", place: request.place, rows: request.rows, unit: request.unit }));
   const logAgent: ActivityLog = ({ connection, ...event }) => record({ ...event, connectionId: connection.id, connectionName: connection.name });
-  const agentTools = createAgentTools(store, pool, requests, logAgent);
-  let removeAgentHook: (() => void) | null = null;
-  const syncAgentHook = async () => {
-    const wanted = (await store.listConnections()).some(agentMayRead);
-    if (wanted && !removeAgentHook) removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, ...agentTools] }));
-    if (!wanted && removeAgentHook) {
-      removeAgentHook();
-      removeAgentHook = null;
+  // Every open Paseo window subscribes, so an agent's open-tab request reaches each of them.
+  const openers = new Set<(event: AgentOpenEvent) => Promise<void>>();
+  server.handle(subscriptions.agentOpens, (_input, context) => {
+    const push = (event: AgentOpenEvent) => context.push(event);
+    openers.add(push);
+    context.signal.addEventListener("abort", () => openers.delete(push));
+  });
+  const openInTab: OpenInTab = async (event) => {
+    // An open window saves the place once it moves there, so a person who declines, or keeps pending edits, keeps
+    // their own. With no window, it is saved here for next time; a production place never is, as no one agreed.
+    if (!event.production && openers.size === 0) {
+      await workspace.update((state) => {
+        state.places[`panel:${event.workspaceId}`] = event.place;
+      });
     }
+    await Promise.all([...openers].map((push) => push(event).catch(onStray)));
+    return openers.size;
   };
+  const agentTools = createAgentTools(store, pool, requests, logAgent, openInTab);
+  // Declared once, with the same list for every session, so changing what is shared never makes sessions reopen.
+  // Each tool checks the connection on every call. The handler does no work, because one that throws would stop
+  // every agent on the daemon from opening a session.
+  const removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, ...agentTools] }));
 
   // Sockets die, and a driver event with no listener would otherwise end this process and every job in
   // it. Log it, without details that could hold a secret, and let the pool rebuild on the next request.
   process.on("uncaughtException", onStray);
   process.on("unhandledRejection", onStray);
-  void syncAgentHook().catch(onStray);
 
   const startBatch = async (ref: ObjectRef, input: RpcInput<typeof rpc.writeBatch>, stillWanted: () => void): Promise<StartResult> =>
     pool.use(ref.connectionId, async (adapter, connection) => {
@@ -155,7 +165,6 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
       requests.expireConnection(saved.id, "The connection was changed.");
       // The next request connects with the new settings.
       await pool.disconnect(saved.id);
-      await syncAgentHook();
       return toView(saved);
     }),
   );
@@ -165,7 +174,6 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
       requests.expireConnection(id, "The connection was deleted.");
       await pool.disconnect(id);
       await store.deleteConnection(id);
-      await syncAgentHook();
       await activity.update((state) => {
         state.events = state.events.filter((event) => event.connectionId !== id);
       });
@@ -214,7 +222,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   server.handle(rpc.describeObject, guard(async (ref: ObjectRef) => withDeadline(pool.use(ref.connectionId, (adapter) => adapter.describe(ref)))));
   server.handle(rpc.readRows, guard(async ({ ref, query }: RpcInput<typeof rpc.readRows>) => withDeadline(pool.use(ref.connectionId, async (adapter) => adapter.read(ref, query, (await preferences.get()).cellPreviewChars)))));
   server.handle(rpc.readRow, guard(async ({ ref, key }: RpcInput<typeof rpc.readRow>) => withDeadline(pool.use(ref.connectionId, (adapter) => adapter.readRow(ref, key)))));
-  server.handle(rpc.countRows, guard(async ({ ref, filters }: RpcInput<typeof rpc.countRows>) => jobs.start("count", null, async () => ({ count: await pool.use(ref.connectionId, (adapter) => adapter.count(ref, filters)) }))));
+  server.handle(rpc.countRows, guard(async ({ ref, filters }: RpcInput<typeof rpc.countRows>) => jobs.start("count", null, async () => ({ count: await pool.use(ref.connectionId, (adapter) => adapter.count(ref, filters, READ_DEADLINE_MS)) }))));
 
   server.handle(
     rpc.writeRows,
@@ -239,7 +247,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   server.handle(
     rpc.decideAgentRequest,
     guard(async ({ id, approve }: RpcInput<typeof rpc.decideAgentRequest>) => {
-      const event = (action: AgentActivityEvent["action"], item: { agentId: string; agentTitle: string | null; connectionId: string; connectionName: string; place: string; rows: number }) => record({ agentId: item.agentId, agentTitle: item.agentTitle, connectionId: item.connectionId, connectionName: item.connectionName, action, place: item.place, rows: item.rows });
+      const event = (action: AgentActivityEvent["action"], item: { agentId: string; agentTitle: string | null; connectionId: string; connectionName: string; place: string; rows: number; unit: AgentActivityEvent["unit"] }) => record({ agentId: item.agentId, agentTitle: item.agentTitle, connectionId: item.connectionId, connectionName: item.connectionName, action, place: item.place, rows: item.rows, unit: item.unit });
       if (!approve) {
         const rejected = requests.reject(id);
         event("rejected", rejected);
@@ -248,13 +256,18 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
       // Flipped first, so a second press cannot run it. Everything slow happens in the job, past the RPC limit.
       const request = requests.take(id);
       event("approved", request);
-      jobs.start("write", null, async () => {
+      jobs.start("write", null, async ({ signal }) => {
         try {
           const affected = await pool.use(request.connectionId, async (adapter, connection) => {
             // Asked again now, because the answer may have changed while this waited.
             if (agentRowLevel(connection) !== "propose") throw new Error("This connection no longer takes proposed changes.");
             if (agentTarget(connection) !== request.target) throw new Error("This connection now points somewhere else, so this was not run.");
             gate({ mode: connection.safety === "read-only" ? "read-only" : "open", writes: true, confirmed: true, preview: `Write to ${request.place}` });
+            if (request.statements) {
+              const scope = { connectionId: request.ref.connectionId, database: request.ref.database, schema: request.ref.schema };
+              const results = await adapter.run(request.statements, { scope, limit: 100, timeoutMs: PROPOSED_RUN_MS, signal: AbortSignal.any([signal, AbortSignal.timeout(PROPOSED_RUN_MS)]), readOnly: false, cellLimit: CELL_LIMIT, bytesAsSize: false });
+              return results.reduce((sum, result) => sum + (result.affected ?? 0), 0);
+            }
             if (request.inserts && adapter.planInserts) return (await adapter.planInserts(request.ref, request.inserts)).run();
             if (request.edits && adapter.planBatch) return (await adapter.planBatch(request.ref, request.edits)).run();
             throw new Error("This engine cannot commit several writes as one.");
@@ -264,8 +277,10 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
           event("done", request);
           return { affected };
         } catch (error) {
-          request.status = error instanceof CommitUnknown ? "unknown" : "failed";
-          request.message = errorMessage(error);
+          const ran = error instanceof PartialRunError && request.statements ? error.results.length : 0;
+          request.ran = request.statements ? ran : null;
+          request.status = error instanceof CommitUnknown ? "unknown" : ran > 0 ? "partial" : "failed";
+          request.message = ran > 0 ? `${ran} of ${request.statements?.length ?? 0} statements ran before one failed; those stay applied. Read the data before proposing again. ${errorMessage(error)}` : errorMessage(error);
           event("failed", request);
           throw error;
         }
@@ -414,7 +429,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
               if (keepHistory) await store.addHistory(connection.id, { text: input.text, durationMs: Date.now() - started, ok }, historyLength).catch(() => undefined);
             };
             try {
-              const results: QueryResult[] = await pool.use(connection.id, (live) => live.run(statements, { scope: input.scope, limit: input.limit, timeoutMs: input.timeoutMs, signal: combined, readOnly: connection.safety === "read-only" }));
+              const results: QueryResult[] = await pool.use(connection.id, (live) => live.run(statements, { scope: input.scope, limit: input.limit, timeoutMs: input.timeoutMs, signal: combined, readOnly: connection.safety === "read-only", cellLimit: CELL_LIMIT, bytesAsSize: false }));
               await finish(true);
               return { results };
             } catch (error) {
@@ -635,7 +650,7 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
     process.off("uncaughtException", onStray);
     process.off("unhandledRejection", onStray);
     preferences.close();
-    removeAgentHook?.();
+    removeAgentHook();
     jobs.cancelAll();
     await pool.closeAll();
   };

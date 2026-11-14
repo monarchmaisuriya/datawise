@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentRequestItem, AgentRequestSummary, EnvironmentLabel, ObjectRef, StagedEdit } from "../shared/contracts";
+import type { ParsedStatement } from "./adapters/types";
 
 const TTL_MS = 30 * 60 * 1000;
 const FORGET_AFTER_MS = 60 * 60 * 1000;
@@ -16,6 +17,11 @@ export interface AgentRequest extends AgentRequestSummary {
   // Exactly one of these is what runs, once a person approves.
   inserts: Record<string, unknown>[] | null;
   edits: StagedEdit[] | null;
+  statements: ParsedStatement[] | null;
+  // On an engine without transactions, one failed statement can still have changed some data.
+  mayBePartial: boolean;
+  // How many proposed statements ran before one failed. The agent gets this count, never the database's error.
+  ran: number | null;
 }
 
 export interface NewRequest {
@@ -30,10 +36,12 @@ export interface NewRequest {
   items: AgentRequestItem[];
   inserts: Record<string, unknown>[] | null;
   edits: StagedEdit[] | null;
+  statements: ParsedStatement[] | null;
+  mayBePartial: boolean;
 }
 
 function summary(request: AgentRequest): AgentRequestSummary {
-  const { ref: _ref, target: _target, items: _items, inserts: _inserts, edits: _edits, ...rest } = request;
+  const { ref: _ref, target: _target, items: _items, inserts: _inserts, edits: _edits, statements: _statements, mayBePartial: _mayBePartial, ran: _ran, ...rest } = request;
   return rest;
 }
 
@@ -70,7 +78,7 @@ export class AgentRequests {
     const refusal = this.limitReached(fields.connectionId, fields.agentId);
     if (refusal) throw new Error(refusal);
     const now = Date.now();
-    const request: AgentRequest = { ...fields, id: randomUUID(), rows: fields.items.length, status: "pending", message: null, affected: null, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + TTL_MS).toISOString() };
+    const request: AgentRequest = { ...fields, id: randomUUID(), rows: fields.items.length, unit: fields.statements ? "statements" : "rows", status: "pending", message: null, affected: null, ran: null, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + TTL_MS).toISOString() };
     this.requests.set(request.id, request);
     return request;
   }

@@ -20,6 +20,10 @@ export interface RunContext {
   signal: AbortSignal;
   // The session must refuse writes, so a misclassified statement still cannot change data.
   readOnly: boolean;
+  // Values longer than this are cut and listed; an agent gets less than a person.
+  cellLimit: number;
+  // Shows binary as its size, for a reader who must not get the bytes.
+  bytesAsSize: boolean;
 }
 
 export interface StreamBatch {
@@ -41,7 +45,8 @@ export interface Adapter {
   describe(ref: ObjectRef): Promise<ObjectDetails>;
   // A page for the grid. Values longer than cellLimit are cut and listed; keys never are.
   read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage>;
-  count(ref: ObjectRef, filters: Filter[]): Promise<number>;
+  // Stops at the deadline: a count can be a full scan, which some engines bill.
+  count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number>;
   readRow(ref: ObjectRef, key: RowKey): Promise<RowPage>;
   planWrite(ref: ObjectRef, op: WriteOp): Promise<WritePlan>;
   planDestroy(ref: ObjectRef, action: "drop" | "truncate"): Promise<WritePlan>;
@@ -49,7 +54,7 @@ export interface Adapter {
   planBatch?(ref: ObjectRef, edits: StagedEdit[]): Promise<WritePlan>;
   planInserts?(ref: ObjectRef, rows: Record<string, unknown>[]): Promise<WritePlan>;
   // A read that cannot change anything, for callers that are not a person at the keyboard.
-  readIsolated?(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage>;
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage>;
   readRowIsolated?(ref: ObjectRef, key: RowKey): Promise<RowPage>;
   // Splits text into statements and marks each read or write. Anything not proved a read is a write.
   parse(text: string): Promise<ParsedStatement[]>;

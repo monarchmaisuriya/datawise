@@ -5,7 +5,10 @@ import { Text } from "react-native";
 import { DatawiseApp } from "./client/app";
 import { SqlFilePanel, SqliteFilePanel } from "./client/file-panels";
 import { SettingsScreen } from "./client/settings-screen";
-import { rpc, structureAttachment } from "./shared/contracts";
+import { receiveAgentOpen } from "./client/agent-open";
+import { rpc, structureAttachment, subscriptions } from "./shared/contracts";
+
+const REOPEN_AFTER_MS = 5000;
 
 function SidebarItem({ currentScreen, openScreen, theme }: PluginSidebarItemProps) {
   const listRequests = useRpc(rpc.listAgentRequests);
@@ -41,5 +44,34 @@ export default function contribute(client: PluginClientContext) {
       openSettings("preferences");
     },
   });
-  return () => {};
+  // Agents ask through this channel to show a place in their workspace's Datawise tab. The daemon closes it when it
+  // restarts and does not reopen it, so it is reopened here until the plugin stops.
+  let stopped = false;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let release = () => {};
+  const listen = () => {
+    release = client.subscribe(
+      subscriptions.agentOpens,
+      {},
+      (event) => {
+        if (!receiveAgentOpen(event)) return;
+        try {
+          client.openPanel("browser", { workspaceId: event.workspaceId });
+        } catch (error) {
+          console.error("Datawise: could not open its tab for an agent:", error instanceof Error ? error.message : String(error));
+        }
+      },
+      {
+        onClosed: () => {
+          if (!stopped) retry = setTimeout(listen, REOPEN_AFTER_MS);
+        },
+      },
+    );
+  };
+  listen();
+  return () => {
+    stopped = true;
+    if (retry !== undefined) clearTimeout(retry);
+    release();
+  };
 }

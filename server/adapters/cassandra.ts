@@ -151,7 +151,12 @@ class CassandraAdapter implements Adapter {
     return decoded;
   }
 
-  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+  // An agent's read. Datawise builds this query itself, so no agent-written text reaches the database.
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    return this.read(ref, query, cellLimit, true);
+  }
+
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number, bytesAsSize = false): Promise<RowPage> {
     if (query.sort) throw new Error("Cassandra returns rows in clustering order only, so a table cannot be sorted here.");
     const client = await this.client();
     const columns = await this.columnRows(ref);
@@ -160,7 +165,7 @@ class CassandraAdapter implements Adapter {
     const result = await client.execute(`SELECT * FROM ${this.table(ref)}${where.sql}${where.filtering ? " ALLOW FILTERING" : ""}`, where.params, { prepare: true, fetchSize: query.limit, pageState: query.cursor ?? undefined });
     const names = result.columns?.map((column) => column.name) ?? columns.map((column) => column.name);
     const key = view ? [] : this.keyOf(columns);
-    const finished = finishRows(result.rows.map((row) => names.map((name) => this.toPlain(row.get(name)))), null, cellLimit, false, positionsOf(names, key));
+    const finished = finishRows(result.rows.map((row) => names.map((name) => this.toPlain(row.get(name)))), null, cellLimit, bytesAsSize, positionsOf(names, key));
     return {
       columns: names.map((name) => ({ name, type: columns.find((column) => column.name === name)?.type ?? null, nullable: !key.includes(name), defaultValue: null, isKey: key.includes(name), generated: false })),
       keyColumns: key,
@@ -181,10 +186,10 @@ class CassandraAdapter implements Adapter {
     return value;
   }
 
-  async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
     const client = await this.client();
     const where = this.where(filters, await this.columnRows(ref));
-    const result = await client.execute(`SELECT COUNT(*) FROM ${this.table(ref)}${where.sql}${where.filtering ? " ALLOW FILTERING" : ""}`, where.params, { prepare: true });
+    const result = await client.execute(`SELECT COUNT(*) FROM ${this.table(ref)}${where.sql}${where.filtering ? " ALLOW FILTERING" : ""}`, where.params, { prepare: true, readTimeout: timeoutMs });
     return Number(result.first()?.get(0) ?? 0);
   }
 
@@ -309,7 +314,7 @@ class CassandraAdapter implements Adapter {
           }
           pageState = truncated ? undefined : (result.pageState ?? undefined);
         } while (pageState);
-        const finished = finishRows(rows);
+        const finished = finishRows(rows, null, context.cellLimit, context.bytesAsSize);
         results.push({ statement: statement.text, columns, rows: finished.rows, cutCells: finished.cutCells, truncated: truncated || finished.truncated, affected: null, durationMs: Date.now() - started, message: null });
       } catch (error) {
         throw new PartialRunError(errorMessage(error), results);

@@ -21,7 +21,7 @@ const TLS_TEXT: Record<TlsMode, string> = {
 
 const ROW_ACCESS_TEXT: Record<AgentRowAccess, string> = {
   none: "Agents get names and types only.",
-  read: "Every agent can read rows here without asking you. Row data goes to the agent's provider and stays in that chat. Rows can hold text someone else wrote, and an agent with a shell could act on it, including writing to this database directly.",
+  read: "Every agent can read rows and run read queries here without asking you. A query reaches anything this database user can read, including other databases, system tables and, on some servers, files or other hosts through functions. Row data goes to the agent's provider and stays in that chat. Rows can hold text someone else wrote, and an agent with a shell could act on it, including writing to this database directly.",
   propose: "Agents can also propose changes. Each one waits for you to approve it in Datawise, in every agent mode. This guards these tools only. A database user without write rights is the only full guarantee.",
 };
 
@@ -182,8 +182,8 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
     if (parsed.password) setPassword(parsed.password);
   };
 
-  const namesAllowed = info.catalogSchema && draft.environment !== "production";
-  const rowsAllowed = namesAllowed && draft.agentAccess === "schema" && rowAccessPossible(draft.engine, draft.environment);
+  const namesAllowed = draft.environment !== "production";
+  const rowsAllowed = namesAllowed && draft.agentAccess === "schema" && rowAccessPossible(draft.environment);
 
   const build = (): ConnectionInput => ({
     id: connection?.id,
@@ -395,7 +395,7 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
                   <Text style={ui.label}>Agent access</Text>
                   <Segmented label="Agent access" value={draft.agentAccess} options={[{ label: "No access", value: "none" as const }, { label: "Table and column names", value: "schema" as const }]} onChange={(agentAccess) => set({ agentAccess })} />
                   <Text style={ui.muted}>
-                    {draft.agentAccess === "schema" ? "Every agent can read this connection's table names, column names and types. Names can hold text someone else wrote. Turning this on or off makes open agent sessions reopen before their next prompt. Agents only get this while Paseo's \"Enable Paseo tools\" host setting is on." : "Agents cannot see this connection through Datawise."}
+                    {draft.agentAccess === "schema" ? `Every agent can read this connection's table names, column names and types. Names can hold text someone else wrote.${info.catalogSchema ? "" : " Names here come from your data: collection, key, index or label names, and field names seen in recent records."} Agents only get this while Paseo's "Enable Paseo tools" host setting is on.` : "Agents cannot see this connection through Datawise."}
                   </Text>
                 </View>
                 {rowsAllowed ? (
@@ -404,7 +404,7 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
                     <Segmented label="Agents and rows" value={draft.agentRowAccess === "propose" && draft.safety === "read-only" ? "read" : draft.agentRowAccess} options={[{ label: "No rows", value: "none" as const }, { label: "Read rows", value: "read" as const }, ...(draft.safety === "read-only" ? [] : [{ label: "Propose changes", value: "propose" as const }])]} onChange={(agentRowAccess) => set({ agentRowAccess })} />
                     <Text style={ui.muted}>{ROW_ACCESS_TEXT[draft.agentRowAccess === "propose" && draft.safety === "read-only" ? "read" : draft.agentRowAccess]}</Text>
                   </View>
-                ) : draft.agentAccess === "schema" && ENGINES[draft.engine].transactionalEdits ? (
+                ) : draft.agentAccess === "schema" ? (
                   <Text style={ui.muted}>To share rows, label this connection Development or Staging.</Text>
                 ) : null}
               </Section>

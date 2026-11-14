@@ -1,4 +1,4 @@
-import { defineAttachmentSource, defineRpc } from "@getpaseo/plugin";
+import { defineAttachmentSource, defineRpc, defineSubscription } from "@getpaseo/plugin";
 import { z } from "zod";
 import { clampWidth } from "./column-width";
 import { ENGINE_IDS, FILTER_OPS } from "./engines";
@@ -242,6 +242,18 @@ export const savedPlace = z.object({
 });
 export type SavedPlace = z.infer<typeof savedPlace>;
 
+// An agent asking to show a place in the Datawise tab of its workspace. A production connection carries who is
+// asking, because the person must agree before it opens, and its place is saved only after that.
+// How long a request waits for its workspace's Datawise tab, the same as a proposal waits for approval.
+export const AGENT_OPEN_KEPT_MS = 30 * 60 * 1000;
+export const agentOpenEvent = z.object({
+  workspaceId: z.string(),
+  place: savedPlace,
+  text: z.string().max(256 * 1024).nullable(),
+  production: z.object({ agentTitle: z.string(), connectionName: z.string() }).nullable(),
+});
+export type AgentOpenEvent = z.infer<typeof agentOpenEvent>;
+
 export const queryTabRecord = z.object({ id: z.string(), name: z.string().max(60), text: z.string().max(1024 * 1024) });
 export type QueryTabRecord = z.infer<typeof queryTabRecord>;
 export const queryTabs = z.object({ activeId: z.string(), tabs: z.array(queryTabRecord).max(30) });
@@ -251,6 +263,7 @@ export const agentRequestItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("insert"), values: z.record(z.string(), z.unknown()) }),
   z.object({ kind: z.literal("update"), key: rowKey, changes: z.array(z.object({ column: z.string(), before: z.unknown(), after: z.unknown() })) }),
   z.object({ kind: z.literal("delete"), key: rowKey, row: z.record(z.string(), z.unknown()) }),
+  z.object({ kind: z.literal("statement"), text: z.string() }),
 ]);
 export type AgentRequestItem = z.infer<typeof agentRequestItem>;
 
@@ -263,7 +276,10 @@ export const agentRequestSummary = z.object({
   environment: environmentLabel,
   place: z.string(),
   rows: z.number(),
-  status: z.enum(["pending", "running", "done", "failed", "unknown", "rejected", "expired"]),
+  // What rows counts: rows changed by a row proposal, or statements in a query proposal.
+  unit: z.enum(["rows", "statements"]),
+  // partial: some statements of a query proposal ran before one failed, and those stay applied.
+  status: z.enum(["pending", "running", "done", "failed", "partial", "unknown", "rejected", "expired"]),
   message: z.string().nullable(),
   affected: z.number().nullable(),
   createdAt: z.string(),
@@ -280,6 +296,8 @@ export const agentActivityEvent = z.object({
   action: z.enum(["read", "proposed", "approved", "rejected", "expired", "done", "failed"]),
   place: z.string(),
   rows: z.number(),
+  // Absent in logs written before statement proposals, which counted only rows.
+  unit: z.enum(["rows", "statements"]).default("rows"),
 });
 export type AgentActivityEvent = z.infer<typeof agentActivityEvent>;
 
@@ -361,6 +379,10 @@ export type StartResult = z.infer<typeof startResult>;
 const empty = z.object({});
 const byId = z.object({ id: z.string() });
 const ok = z.object({ ok: z.literal(true) });
+
+export const subscriptions = {
+  agentOpens: defineSubscription({ name: "agent.opens", input: z.object({}), event: agentOpenEvent }),
+};
 
 export const rpc = {
   listConnections: defineRpc({ name: "connections.list", input: empty, output: z.object({ connections: z.array(connectionView) }) }),

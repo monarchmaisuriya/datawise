@@ -311,11 +311,11 @@ class MongoAdapter implements Adapter {
     return sort ? { [sort.column]: sort.descending ? -1 : 1 } : undefined;
   }
 
-  private async pageFromDocs(documents: Document[], limit: number | null, offset: number, fetched: number, cellLimit: number): Promise<RowPage> {
+  private async pageFromDocs(documents: Document[], limit: number | null, offset: number, fetched: number, cellLimit: number, bytesAsSize: boolean): Promise<RowPage> {
     const { EJSON } = await extendedJson();
     const relaxed = documents.map((document) => EJSON.serialize(document, { relaxed: true }) as Document);
     const names = fieldsOf(relaxed);
-    const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)), limit, cellLimit, false, positionsOf(names, ["_id"]));
+    const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)), limit, cellLimit, bytesAsSize, positionsOf(names, ["_id"]));
     return {
       columns: names.map((name): ColumnInfo => ({ name, type: null, nullable: true, defaultValue: null, isKey: name === "_id", generated: name === "_id" })),
       keyColumns: ["_id"],
@@ -328,19 +328,24 @@ class MongoAdapter implements Adapter {
     };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+  // An agent's read. Datawise builds this query itself, so no agent-written text reaches the database.
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    return this.read(ref, query, cellLimit, true);
+  }
+
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number, bytesAsSize = false): Promise<RowPage> {
     const db = await this.db(ref);
     const offset = query.cursor === null ? 0 : Number(query.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid page position.");
     const documents = await db.collection(ref.name).find(await this.compileFilters(query.filters), { sort: this.toSort(query.sort) }).skip(offset).limit(query.limit + 1).toArray();
-    const page = await this.pageFromDocs(documents, query.limit, offset, documents.length, cellLimit);
+    const page = await this.pageFromDocs(documents, query.limit, offset, documents.length, cellLimit, bytesAsSize);
     const details = await db.listCollections({ name: ref.name }).toArray();
     if (details[0]?.type === "view") return { ...page, keyColumns: [], keyReason: "A view cannot be edited here." };
     return page;
   }
 
-  async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
-    return (await this.db(ref)).collection(ref.name).countDocuments(await this.compileFilters(filters));
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
+    return (await this.db(ref)).collection(ref.name).countDocuments(await this.compileFilters(filters), { maxTimeMS: timeoutMs });
   }
 
   private async keyFilter(key: RowKey): Promise<Document> {
@@ -530,7 +535,7 @@ class MongoAdapter implements Adapter {
         const outcome = await this.execute(call, context);
         const relaxed = (outcome.documents ?? []).map((document) => EJSON.serialize(document, { relaxed: true }) as Document);
         const names = fieldsOf(relaxed);
-        const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)));
+        const finished = finishRows(relaxed.map((document) => names.map((name) => document[name] ?? null)), null, context.cellLimit, context.bytesAsSize);
         results.push({ statement: statement.text, columns: names.map((name) => ({ name, type: null, nullable: null, defaultValue: null, isKey: false, generated: false })), rows: finished.rows, cutCells: finished.cutCells, truncated: outcome.truncated || finished.truncated, affected: outcome.affected, durationMs: Date.now() - started, message: outcome.message });
       } catch (error) {
         throw new PartialRunError(errorMessage(error), results);

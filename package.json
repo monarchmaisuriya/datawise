@@ -1,7 +1,7 @@
 {
   "name": "datawise",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A database client for Paseo: browse, query, edit, import and export PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j.",
   "files": [
     "paseo-plugin.json",
@@ -45,7 +45,7 @@
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.15.1",
+    "@getpaseo/plugin": "0.16.0-beta.2",
     "@tanstack/react-query": "^5.106.1",
     "@types/mssql": "^12.3.0",
     "@types/node": "^24.19.2",

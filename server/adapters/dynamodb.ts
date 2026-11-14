@@ -170,13 +170,18 @@ class DynamoAdapter implements Adapter {
     return { FilterExpression: parts.join(" AND "), ExpressionAttributeNames: names, ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined };
   }
 
-  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+  // An agent's read. Datawise builds this query itself, so no agent-written text reaches the database.
+  readIsolated(ref: ObjectRef, query: ReadQuery, cellLimit: number): Promise<RowPage> {
+    return this.read(ref, query, cellLimit, true);
+  }
+
+  async read(ref: ObjectRef, query: ReadQuery, cellLimit: number, bytesAsSize = false): Promise<RowPage> {
     if (query.sort) throw new Error("DynamoDB tables cannot be sorted by a scan.");
     const { client, sdk } = await this.get();
     const { names, types } = await this.keys(ref.name);
     const result = await client.send(new sdk.ScanCommand({ TableName: ref.name, Limit: query.limit, ExclusiveStartKey: query.cursor ? (JSON.parse(query.cursor) as Item) : undefined, ...this.compile(query.filters) }));
     const { names: columns, rows } = itemsToRows((result.Items ?? []) as Item[], names);
-    const finished = finishRows(rows, null, cellLimit, false, positionsOf(columns, names));
+    const finished = finishRows(rows, null, cellLimit, bytesAsSize, positionsOf(columns, names));
     return {
       columns: columns.map((name) => ({ name, type: types[name] ?? null, nullable: !names.includes(name), defaultValue: null, isKey: names.includes(name), generated: false })),
       keyColumns: names,
@@ -188,12 +193,14 @@ class DynamoAdapter implements Adapter {
     };
   }
 
-  async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
     const { client, sdk } = await this.get();
+    // One deadline for every page, so a large table's scan stops instead of running on, billed, after the answer.
+    const abortSignal = AbortSignal.timeout(timeoutMs);
     let total = 0;
     let start: Item | undefined;
     do {
-      const result = await client.send(new sdk.ScanCommand({ TableName: ref.name, Select: "COUNT", ExclusiveStartKey: start, ...this.compile(filters) }));
+      const result = await client.send(new sdk.ScanCommand({ TableName: ref.name, Select: "COUNT", ExclusiveStartKey: start, ...this.compile(filters) }), { abortSignal });
       total += result.Count ?? 0;
       start = result.LastEvaluatedKey as Item | undefined;
     } while (start);
@@ -316,7 +323,7 @@ class DynamoAdapter implements Adapter {
       try {
         if (statement.text.startsWith("{")) {
           const response = await this.runJson(statement.text);
-          const finished = finishRows([[response]]);
+          const finished = finishRows([[response]], null, context.cellLimit, context.bytesAsSize);
           results.push({ statement: statement.text, columns: [{ ...blank, name: "result" }], rows: finished.rows, cutCells: finished.cutCells, truncated: false, affected: null, durationMs: Date.now() - started, message: null });
           continue;
         }
@@ -333,7 +340,7 @@ class DynamoAdapter implements Adapter {
           }
         } while (token);
         const { names, rows } = itemsToRows(items.slice(0, context.limit), []);
-        const finished = finishRows(rows);
+        const finished = finishRows(rows, null, context.cellLimit, context.bytesAsSize);
         results.push({ statement: statement.text, columns: names.map((name) => ({ ...blank, name })), rows: finished.rows, cutCells: finished.cutCells, truncated: truncated || finished.truncated, affected: null, durationMs: Date.now() - started, message: null });
       } catch (error) {
         throw new PartialRunError(errorMessage(error), results);

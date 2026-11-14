@@ -4,6 +4,27 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-14
+
+### Added
+
+- Agents can open a connection, a table, or query text in their workspace's Datawise tab with `datawise_open`, without any sharing. Every open Paseo window follows. A production connection moves no window: the question waits in that workspace's Datawise tab, and nothing opens unless you say yes. Leaving pending edits asks as it does when you move yourself.
+- Agents can run read statements with `datawise_query`, count rows with `datawise_count`, see a plan with `datawise_explain`, and list recent and saved reads with `datawise_history`, on connections shared for reading rows. Only statements that class as reads run; a session that is read-only or rolled back is the second check where the engine has one.
+- Agents can propose statements with `datawise_propose_query`. Nothing runs until you approve the exact statements in Agent requests. A run that fails partway says how many statements ran.
+
+### Changed
+
+- Requires Paseo 0.16.0-beta.2 or later.
+- **Widens existing grants:** a connection already shared for reading rows now also lets every agent run read queries. A query reaches anything the database user can read, including other databases and system tables, unlike `datawise_read`. Check your shared connections' database users before updating.
+- Names and rows can be shared on all 12 engines, not only those with a catalog or transactions. Production is still refused.
+- Datawise's agent tools are offered to every agent all the time, so turning sharing on or off no longer makes open agent sessions reopen. A tool asked about a connection not shared at its level answers as if it did not exist.
+- Agent activity counts statement proposals in statements. `agent-activity.json` gains an optional field; an older Datawise reading it ignores the field.
+- Row counts on MongoDB, DynamoDB, Cassandra, Elasticsearch and Neo4j stop after 25 seconds, as SQL counts already did, instead of scanning on.
+
+### Fixed
+
+- A filtered Redis table's row count ignored the filter and showed every entry. It now counts the matching entries.
+
 ## [0.5.0] - 2026-11-07
 
 ### Added

@@ -38,7 +38,7 @@ M works in Paseo but must leave it to look at a database. Paseo's registry has o
 - Plugin process runs Electron 44 / Node 24.20 and `node:sqlite` loads. [verified: `ELECTRON_RUN_AS_NODE=1 Paseo -e ...`]
 - Plugin RPC runs inside the daemon's plugin session, so any client that can reach the daemon can call it. Settings RPCs use `daemon.manage`. [verified: Plugin reference, Persisted values] Plugin-level auth does not exist. [inferred: the reference documents no per-plugin auth]
 - Data folder comes from `resolvePaseoHome`. [verified: `contextualise/server/paseo-home.ts:7-14`]
-- Docker has 8 GB and 15 CPUs on arm64. [verified: `docker info`] M's `owly_ai-*` containers are running and must not be touched. [verified: `docker ps`]
+- Docker has 8 GB and 15 CPUs on arm64. [verified: `docker info`] Containers from other projects are running and must not be touched. [verified: `docker ps`]
 
 ## Options considered
 

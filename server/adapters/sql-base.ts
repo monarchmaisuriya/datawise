@@ -308,10 +308,10 @@ export class SqlAdapter implements Adapter {
     return { columns: mergeColumns(result.columns, details), keyColumns: details.keyColumns, keyReason: details.keyReason, rows: finished.rows, cutCells: [], truncated: false, nextCursor: null };
   }
 
-  async count(ref: ObjectRef, filters: Filter[]): Promise<number> {
+  async count(ref: ObjectRef, filters: Filter[], timeoutMs: number): Promise<number> {
     const details = await this.cachedDescribe(ref);
     const where = buildWhere(this.rules, filters, details.columns);
-    const result = await this.withPooled(ref, (session) => this.fetch(session, `SELECT COUNT(*) FROM ${this.rules.table(ref)}${where.sql}`, where.params, 1));
+    const result = await this.withPooled(ref, (session) => this.fetch(session, `SELECT COUNT(*) FROM ${this.rules.table(ref)}${where.sql}`, where.params, 1), timeoutMs);
     return Number(result.rows[0]?.[0] ?? 0);
   }
 
@@ -545,7 +545,7 @@ export class SqlAdapter implements Adapter {
           try {
             // One extra row says the result was cut at the limit.
             const rows = cursor.columns.length > 0 ? await cursor.next(context.limit + 1) : [];
-            const finished = finishRows(rows, context.limit);
+            const finished = finishRows(rows, context.limit, context.cellLimit, context.bytesAsSize);
             results.push({ statement: statement.text, columns: cursor.columns, rows: finished.rows, cutCells: finished.cutCells, truncated: finished.truncated, affected: cursor.affected, durationMs: Date.now() - started, message: null });
           } finally {
             await cursor.close();

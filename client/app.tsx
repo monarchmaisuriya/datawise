@@ -1,8 +1,9 @@
 import type { PluginSurfaceProps, PluginTab } from "@getpaseo/plugin/client";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
-import { type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
+import { type AgentOpenEvent, type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
+import { onAgentOpen, productionQuestion, takeAgentOpen } from "./agent-open";
 import { ENGINES } from "../shared/engines";
 import { AgentRequestsModal, usePendingAgentRequests } from "./agent-requests";
 import { ConnectionForm, ConnectionList, UnlockPrompt } from "./connections";
@@ -45,13 +46,13 @@ export function DatawiseApp(props: PluginSurfaceProps & { workspaceId?: string; 
   return (
     <DatawiseProviders theme={theme} compact={layout.compact}>
       <PendingProvider onCount={tab ? (count) => tab.setModified(count > 0) : undefined}>
-        <Main surface={workspaceId ? `panel:${workspaceId}` : "screen"} />
+        <Main surface={workspaceId ? `panel:${workspaceId}` : "screen"} workspaceId={workspaceId} />
       </PendingProvider>
     </DatawiseProviders>
   );
 }
 
-function Main({ surface }: { surface: string }) {
+function Main({ surface, workspaceId }: { surface: string; workspaceId?: string }) {
   const ui = useUi();
   const api = useApi();
   const ask = useConfirm();
@@ -130,6 +131,37 @@ function Main({ surface }: { surface: string }) {
     if (sure) pending.clearAll();
     return sure;
   };
+
+  // An agent asked to show a place in this workspace's tab. A production connection waits for the person's yes,
+  // and leaving a connection with pending edits asks first, as leaving it by hand does.
+  const showAgentRequest = async (event: AgentOpenEvent) => {
+    if (event.production) {
+      const sure = await ask({ title: "Open a production connection?", preview: productionQuestion(event), reason: "An agent asked for this. Nothing opens unless you say yes.", actionLabel: "Open" });
+      if (!sure) return;
+    }
+    if (event.place.connectionId !== connectionId && !(await leaveAllowed())) return;
+    // The connection may be newer than the list this tab read.
+    await connections.refetch();
+    setConnectionId(event.place.connectionId);
+    setPlace({ database: event.place.database, schema: event.place.schema });
+    setObject(null);
+    setObjectToRestore(event.place.object);
+    setJump(null);
+    setTab(event.text !== null ? "query" : event.place.tab);
+    if (event.text !== null) setQueryPrefill({ text: event.text, revision: Date.now() });
+  };
+  const showLatest = useRef(showAgentRequest);
+  showLatest.current = showAgentRequest;
+  // After the saved place is restored, so a request that opened this tab wins over where it was left.
+  useEffect(() => {
+    if (!restored || !workspaceId) return;
+    const take = () => {
+      const event = takeAgentOpen(workspaceId);
+      if (event) void showLatest.current(event);
+    };
+    take();
+    return onAgentOpen(take);
+  }, [restored, workspaceId]);
 
   const choose = (next: ConnectionView) => {
     setConnectionId(next.id);

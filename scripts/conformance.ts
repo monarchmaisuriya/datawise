@@ -622,7 +622,32 @@ async function runSpec(key: string, spec: Spec) {
     const job = await waitJob(await call(rpc.countRows, { ref: ref(), filters: [] }));
     expect(job.status === "done", job.error);
     expect(job.count === spec.seedRows, `count ${job.count}`);
+    if (spec.engine === "redis") {
+      const filtered = await waitJob(await call(rpc.countRows, { ref: ref(), filters: [{ column: "value", op: "contains", value: "thre" }] }));
+      expect(filtered.count === 1, `filtered count ${filtered.count}`);
+    }
   });
+  // SQL counts were already stopped by their pooled session's deadline, and a tiny one finishes before a cancel
+  // lands, so only the engines whose count passes the deadline to its driver are checked here.
+  // A tiny Neo4j count also finished within 1 ms when tried, so it is left out here like the SQL engines; its
+  // count passes the deadline to the driver all the same.
+  if (["mongodb", "dynamodb", "elasticsearch", "cassandra"].includes(spec.engine)) {
+    await check("a count stops at its deadline", async () => {
+      // The spec's own settings come last, so a blank here never sends a driver to its default, real service.
+      const connection = { ...base, id: "x", host: "", port: null, user: "", database: "", file: "", serviceName: "", localDataCenter: "", region: "", endpoint: "", accessKeyId: "", authSource: "", tls: "off", caCertificate: "", password: "", apiKey: null, ...spec.input, safety: "read-only", ssh: null, rememberPassword: true, sshHostFingerprint: null, sshPassword: null, sshPrivateKey: null, sshPassphrase: null };
+      if (spec.engine === "dynamodb" && !String(connection.endpoint).startsWith("http://127.0.0.1")) throw new Error("DynamoDB checks run only against the local test endpoint.");
+      const adapter = await ADAPTERS[spec.engine]({ connection: connection as never, endpoint: { host: String(spec.input.host ?? "127.0.0.1"), port: Number(spec.input.port ?? 0), tlsServername: String(spec.input.host ?? "127.0.0.1") }, onLost: () => undefined });
+      try {
+        // The same count with room to finish proves a failure below comes from the deadline, not the table.
+        const full = await adapter.count(ref(), [], 25000);
+        expect(full === spec.seedRows, `a count with room to finish returned ${full}`);
+        const counted = await adapter.count(ref(), [], 1).then((total) => `returned ${total}`, () => null);
+        expect(counted === null, `a count with a 1 ms deadline ${counted}`);
+      } finally {
+        await adapter.close();
+      }
+    });
+  }
   await check("query results", async () => {
     const job = await finish(await run(spec.select));
     const rows = job.results?.[0]?.rows.length;
@@ -783,7 +808,7 @@ async function runSpec(key: string, spec: Spec) {
     await check("second layer: with the classifier skipped, the session refuses or undoes the write", async () => {
       const before = (await readAll()).rows.length;
       const adapter = await ADAPTERS[spec.engine]({ connection: { ...base, id: "x", host: String(spec.input.host ?? ""), port: spec.input.port ?? null, user: String(spec.input.user ?? ""), database: String(spec.input.database ?? ""), file: String(spec.input.file ?? ""), serviceName: String(spec.input.serviceName ?? ""), localDataCenter: "", region: "", endpoint: "", accessKeyId: "", authSource: "", tls: spec.input.tls ?? "off", caCertificate: "", safety: "read-only", ssh: null, rememberPassword: true, sshHostFingerprint: null, password: String(spec.input.password ?? ""), apiKey: null, sshPassword: null, sshPrivateKey: null, sshPassphrase: null } as never, endpoint: { host: String(spec.input.host), port: Number(spec.input.port), tlsServername: String(spec.input.host) }, onLost: () => undefined });
-      await adapter.run([{ text: spec.secondLayer as string, class: "read" }], { scope: scope(), limit: 10, timeoutMs: 10000, signal: new AbortController().signal, readOnly: true }).catch(() => undefined);
+      await adapter.run([{ text: spec.secondLayer as string, class: "read" }], { scope: scope(), limit: 10, timeoutMs: 10000, signal: new AbortController().signal, readOnly: true, cellLimit: CELL_LIMIT, bytesAsSize: false }).catch(() => undefined);
       await adapter.close();
       expect((await readAll()).rows.length === before, "the session let a write through");
     });
@@ -835,6 +860,97 @@ async function runSpec(key: string, spec: Spec) {
   }
   const extra = EXTRAS[key];
   if (extra) await extra({ check, expect, ref, run, finish, call, keyOf, scope });
+  await check("agent tools: names, rows, queries and counts; every write refused", async () => {
+    const shared = await call(rpc.saveConnection, { ...base, name: `${spec.label} agent`, safety: "confirm", environment: "development", agentAccess: "schema", agentRowAccess: "read" });
+    const agent = { agent: { id: `agent-${key}`, title: "Agent", workspaceId: null } };
+    const use = async (name: string, input: Record<string, unknown>) => {
+      const hook = theHook();
+      if (!hook) throw new Error("no hook registered");
+      const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+      return tool.execute(tool.input.parse({ connection: shared.name, ...spec.scope, ...input }), agent);
+    };
+    try {
+      const described = await use("datawise_describe", { table: spec.name });
+      expect(!described.isError, `describe: ${described.text}`);
+      const read = await use("datawise_read", { table: spec.name });
+      expect(!read.isError && String(read.text).includes('"rows"'), `read: ${String(read.text).slice(0, 200)}`);
+      const counted = await use("datawise_count", { table: spec.name });
+      expect(!counted.isError && /^\d+ rows$/.test(String(counted.text)), `count: ${counted.text}`);
+      const queried = await use("datawise_query", { query: spec.select });
+      expect(!queried.isError && String(queried.text).includes('"results"'), `query: ${String(queried.text).slice(0, 200)}`);
+      const before = (await readAll()).rows.length;
+      // A read first, then a write, in one text. Redis and the search engines take one request per line.
+      const separator = ["redis", "elasticsearch"].includes(spec.engine) ? "\n" : "; ";
+      for (const attack of [...spec.attacks, `${spec.select}${separator}${spec.attacks[0]}`]) {
+        const refused = await use("datawise_query", { query: attack });
+        // The classifier's own answer, so the text never reached the database as a write.
+        expect(refused.isError && /^Only reads run here/.test(String(refused.text)), `not refused as a write: ${attack} -> ${refused.text}`);
+      }
+      expect((await readAll()).rows.length === before, "a refused write changed the data");
+      if (info.explainPrefix) {
+        const explained = await use("datawise_explain", { query: spec.select });
+        expect(!explained.isError, `explain: ${explained.text}`);
+      }
+      await finish(await call(rpc.runQuery, { scope: { connectionId: shared.id, ...spec.scope }, text: spec.select }));
+      const listed = await use("datawise_history", {});
+      expect(!listed.isError && String(listed.text).includes(JSON.stringify(spec.select).slice(1, -1).slice(0, 20)), `history: ${String(listed.text).slice(0, 200)}`);
+    } finally {
+      await call(rpc.deleteConnection, { id: shared.id }).catch(() => undefined);
+    }
+  });
+  if (spec.engine === "redis") {
+    await check("agent tools: a page cut to fit continues where it stopped", async () => {
+      const fields = Array.from({ length: 200 }, (_, index) => `f${index}`);
+      await finish(await call(rpc.runQuery, { scope: scope(), text: `DEL dw_wide\nHSET dw_wide ${fields.map((field) => `${field} ${"w".repeat(2000)}`).join(" ")}`, confirmed: true }));
+      const shared = await call(rpc.saveConnection, { ...base, name: "Redis wide", safety: "confirm", environment: "development", agentAccess: "schema", agentRowAccess: "read" });
+      try {
+        const hook = theHook();
+        if (!hook) throw new Error("no hook registered");
+        const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === "datawise_read") as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        for (let page = 0; page < 50; page += 1) {
+          const answer = await tool.execute(tool.input.parse({ connection: shared.name, ...spec.scope, table: "dw_wide", limit: 200, ...(cursor ? { cursor } : {}) }), { agent: { id: `agent-wide-${page}`, title: "Agent", workspaceId: null } });
+          expect(!answer.isError, String(answer.text).slice(0, 200));
+          const body = JSON.parse(String(answer.text).slice(String(answer.text).indexOf("{"))) as { rows: unknown[][]; nextCursor: string | null };
+          seen.push(...body.rows.map((row) => String(row[0])));
+          cursor = body.nextCursor;
+          if (!cursor) break;
+        }
+        expect(seen.length === fields.length && new Set(seen).size === fields.length, `read ${seen.length} entries, ${new Set(seen).size} different, of ${fields.length}`);
+      } finally {
+        await call(rpc.deleteConnection, { id: shared.id }).catch(() => undefined);
+        await call(rpc.runQuery, { scope: scope(), text: "DEL dw_wide", confirmed: true }).then(finish, () => undefined);
+      }
+    });
+  }
+  if (spec.engine === "mongodb") {
+    await check("agent tools: MongoDB's own databases and collections are refused", async () => {
+      const shared = await call(rpc.saveConnection, { ...base, name: "MongoDB every database", database: "", safety: "confirm", environment: "development", agentAccess: "schema", agentRowAccess: "read" });
+      const agent = { agent: { id: "agent-mongo-system", title: "Agent", workspaceId: null } };
+      const use = async (name: string, input: Record<string, unknown>) => {
+        const hook = theHook();
+        if (!hook) throw new Error("no hook registered");
+        const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+        return tool.execute(tool.input.parse({ connection: shared.name, ...input }), agent);
+      };
+      // A view makes MongoDB keep system.views in this database.
+      await finish(await call(rpc.runQuery, { scope: scope(), text: 'db.createCollection("dw_view", {viewOn: "dw_items", pipeline: []})', confirmed: true }));
+      try {
+        for (const database of ["admin", "local", "config"]) {
+          const read = await use("datawise_read", { database, table: "system.users" });
+          expect(read.isError && /No database named/.test(String(read.text)), `${database}: ${String(read.text).slice(0, 200)}`);
+        }
+        const collection = await use("datawise_read", { database: "dw", table: "system.views" });
+        expect(collection.isError && /No table named/.test(String(collection.text)), `system.views: ${String(collection.text).slice(0, 200)}`);
+        const listed = await use("datawise_describe", { database: "dw" });
+        expect(!String(listed.text).includes("system."), `listed: ${String(listed.text).slice(0, 300)}`);
+      } finally {
+        await call(rpc.deleteConnection, { id: shared.id }).catch(() => undefined);
+        await call(rpc.runQuery, { scope: scope(), text: "db.dw_view.drop()", confirmed: true }).then(finish, () => undefined);
+      }
+    });
+  }
   await check("explain refuses a second statement", async () => {
     if (!info.explainPrefix) return;
     const refused = await call(rpc.runQuery, { scope: scope(), text: `${spec.select}; ${spec.attacks[0]}`, explain: true }).then(
@@ -1179,7 +1295,8 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
     await call(rpc.saveConnection, { id: saved.id, name: saved.name, engine: spec.engine, safety: "open", agentAccess: "none", ...spec.input });
     const answer = await tool.execute({ connection: saved.name, table: spec.child, ...spec.scope }, {});
     expectThat(answer.isError === true && !String(answer.text).includes(spec.note), String(answer.text));
-    expectThat(theHook() === undefined, "hook still registered");
+    // The tool list stays the same for every session; the refusal above is what turning access off does.
+    expectThat(theHook() !== undefined, "the hook should stay registered with a fixed tool list");
   });
   await lines.check("an attachment holds structure only, from an open connection", async () => {
     await call(rpc.readRows, { ref: child, query: { limit: 1 } });
@@ -1200,8 +1317,9 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
     const found = await call(searchStructure, { query: "dw_child" });
     expectThat(found.items.every((entry) => !entry.id.startsWith(saved.id)), JSON.stringify(found).slice(0, 200));
   });
-  const agentA = { agent: { id: "agent-a", title: "Agent A" } };
-  const agentB = { agent: { id: "agent-b", title: "Agent B" } };
+  // A new agent for each check, so the per-agent call limit counts one check's calls, as one agent's task would.
+  const agentA = { get agent() { return { id: `agent-a-${lines.lines.length}`, title: "Agent A" }; } };
+  const agentB = { get agent() { return { id: `agent-b-${lines.lines.length}`, title: "Agent B" }; } };
   const useTool = async (name: string, input: unknown, context: unknown = agentA) => {
     const hook = theHook();
     if (!hook) throw new Error("no hook registered");
@@ -1251,6 +1369,28 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
     const names = await useTool("datawise_read", { connection: `${rowsName}-names`, table: spec.child, ...spec.scope });
     const unknown = await useTool("datawise_read", { connection: "nothing", table: spec.child, ...spec.scope });
     expectThat(names.isError === true && unknown.isError === true && String(names.text).replace(`${rowsName}-names`, "X") === String(unknown.text).replace("nothing", "X"), `${names.text} / ${unknown.text}`);
+  });
+  await lines.check("queries: a proposal runs once after approval, and a failure partway says how many ran", async () => {
+    const before = rowNote((await readAll(rowsName)).rows, (await readAll(rowsName)).columns, 1);
+    const proposed = await useTool("datawise_propose_query", { connection: rowsName, ...spec.scope, query: `update ${spec.child} set ${spec.note} = 'PROPOSED_QUERY' where ${spec.id} = 1` });
+    const id = (proposed as { structuredContent?: { requestId?: string } }).structuredContent?.requestId as string;
+    expectThat(!proposed.isError && Boolean(id), String(proposed.text));
+    const waiting = await readAll(rowsName);
+    expectThat(rowNote(waiting.rows, waiting.columns, 1) === before, "a proposal ran before approval");
+    await call(rpc.decideAgentRequest, { id, approve: true });
+    expectThat((await settled(id)).status === "done", "approved proposal did not finish");
+    const after = await readAll(rowsName);
+    expectThat(rowNote(after.rows, after.columns, 1) === "PROPOSED_QUERY", "approved proposal did not land");
+    const status = await useTool("datawise_write_status", { requestId: id });
+    expectThat(/Done/.test(String(status.text)), String(status.text));
+    const halfway = await useTool("datawise_propose_query", { connection: rowsName, ...spec.scope, query: `update ${spec.child} set ${spec.note} = 'FIRST_RAN' where ${spec.id} = 1;\nupdate dw_no_such_table set x = 1` });
+    const halfwayId = (halfway as { structuredContent?: { requestId?: string } }).structuredContent?.requestId as string;
+    expectThat(!halfway.isError && Boolean(halfwayId), String(halfway.text));
+    await call(rpc.decideAgentRequest, { id: halfwayId, approve: true });
+    const ended = await settled(halfwayId);
+    expectThat(ended.status === "partial" && /1 of 2/.test(String(ended.message)), `${ended.status}: ${ended.message}`);
+    const halfStatus = await useTool("datawise_write_status", { requestId: halfwayId });
+    expectThat(/1 of 2/.test(String(halfStatus.text)), String(halfStatus.text));
   });
   await lines.check("rows: the read level cannot propose", async () => {
     await rowsConnection(`${rowsName}-read`, { agentRowAccess: "read" });
@@ -1565,16 +1705,18 @@ async function runSettingsAndViews() {
     await call(rpc.deleteConnection, { id: first.id });
     await call(rpc.deleteConnection, { id: second.id });
   });
-  await lines.check("agent access is refused on production and on engines without a catalog", async () => {
+  await lines.check("agent access is refused on production, and allowed on every other engine", async () => {
     await refusal(call(rpc.saveConnection, { name: "a1", ...base, environment: "production", safety: "confirm", agentAccess: "schema" }));
-    for (const engine of ["redis", "mongodb", "dynamodb", "neo4j", "elasticsearch"]) await refusal(call(rpc.saveConnection, { name: "a2", engine, host: "localhost", agentAccess: "schema" }));
+    for (const engine of ["redis", "mongodb", "dynamodb", "neo4j", "elasticsearch"]) {
+      const saved = await call(rpc.saveConnection, { name: `a2-${engine}`, engine, host: "localhost", agentAccess: "schema" });
+      await call(rpc.deleteConnection, { id: saved.id });
+    }
   });
-  await lines.check("no hook unless a connection is shared", async () => {
-    expectThat(theHook() === undefined, "hook registered with nothing shared");
+  await lines.check("the tool hook is registered once, shared or not", async () => {
+    expectThat(theHook() !== undefined, "no hook with nothing shared");
     const saved = await call(rpc.saveConnection, { name: "shared", ...base, agentAccess: "schema" });
-    expectThat(theHook() !== undefined, "no hook once shared");
     await call(rpc.deleteConnection, { id: saved.id });
-    expectThat(theHook() === undefined, "hook kept after the last shared connection went");
+    expectThat(theHook() !== undefined, "hook gone after the last shared connection went");
   });
   await lines.check("labels survive a save and a read", async () => {
     const saved = await call(rpc.saveConnection, { name: "labels", ...base, environment: "staging", color: "amber", group: "Team" });

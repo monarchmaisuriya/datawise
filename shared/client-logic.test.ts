@@ -1,11 +1,13 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { agentRowAccessRefusal, agentRowLevel } from "./agent-access";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentRowAccessRefusal, agentRowLevel, rowAccessPossible } from "./agent-access";
+import { ENGINE_IDS } from "./engines";
 import { visibleText, visibleValue } from "./agent-display";
 import { jumpFilters } from "./foreign-keys";
 import { clampWidth } from "./column-width";
-import { savedView } from "./contracts";
+import { AGENT_OPEN_KEPT_MS, agentActivityEvent, savedView } from "./contracts";
+import { productionQuestion, receiveAgentOpen, takeAgentOpen } from "../client/agent-open";
 import { wholeKey } from "./row-key";
 import { columnRange, groupDigits, hexPreview } from "./grid-display";
 import { toMarkdownTable } from "./markdown";
@@ -109,9 +111,13 @@ describe("agent access to rows", () => {
     expect(agentRowAccessRefusal({ ...base, environment: "none" })).toMatch(/development or staging/);
     expect(agentRowLevel({ ...base, environment: "production" })).toBe("none");
   });
-  it("refuses an engine without transactions across rows", () => {
-    expect(agentRowAccessRefusal({ ...base, engine: "clickhouse" })).toMatch(/does not support/);
-    expect(agentRowLevel({ ...base, engine: "mongodb" })).toBe("none");
+  it("allows names and rows on every engine, never on production", () => {
+    for (const engine of ENGINE_IDS) {
+      expect(agentRowAccessRefusal({ ...base, engine, agentRowAccess: "read" })).toBeNull();
+      expect(agentRowLevel({ ...base, engine, agentRowAccess: "read" })).toBe("read");
+      expect(rowAccessPossible("production")).toBe(false);
+      expect(rowAccessPossible("staging")).toBe(true);
+    }
   });
   it("needs names shared first", () => {
     expect(agentRowAccessRefusal({ ...base, agentAccess: "none" })).toMatch(/Share table and column names/);
@@ -137,6 +143,34 @@ describe("saved column widths", () => {
   it("are clamped or dropped one by one, so a bad value never sets every view aside", () => {
     expect(savedView.parse({ columnWidths: { a: 5000, b: "wide", c: -3, d: 150 } }).columnWidths).toEqual({ a: 800, c: 60, d: 150 });
     expect(savedView.parse({}).columnWidths).toEqual({});
+  });
+});
+
+describe("agent activity written by an older Datawise", () => {
+  it("reads a count without a unit as rows", () => {
+    const old = { at: "2026-11-01T00:00:00.000Z", agentId: "a", agentTitle: null, connectionId: "c", connectionName: "Dev", action: "proposed", place: "users", rows: 2 };
+    expect(agentActivityEvent.parse(old).unit).toBe("rows");
+  });
+});
+
+describe("an agent's request to open a tab", () => {
+  afterEach(() => vi.useRealTimers());
+  const place = { connectionId: "c", object: null, tab: "data" as const };
+  it("moves no window for production, so nothing changes before the person says yes", () => {
+    expect(receiveAgentOpen({ workspaceId: "w1", place, text: null, production: null })).toBe(true);
+    expect(receiveAgentOpen({ workspaceId: "w2", place, text: null, production: { agentTitle: "A", connectionName: "Live" } })).toBe(false);
+    expect(takeAgentOpen("w2")?.production).toEqual({ agentTitle: "A", connectionName: "Live" });
+  });
+  it("asks about production with the agent's words shown as codes, and says when query text comes too", () => {
+    const question = productionQuestion({ workspaceId: "w", place, text: "select 1", production: { agentTitle: "A\nOpen", connectionName: "Live" } });
+    expect(question).toBe('"A\\nOpen" wants to open "Live". It also puts query text in a tab; nothing runs.');
+    expect(productionQuestion({ workspaceId: "w", place, text: null, production: { agentTitle: "A", connectionName: "Live" } })).toBe('"A" wants to open "Live".');
+  });
+  it("is dropped once it has waited too long, so an old question never appears later", () => {
+    vi.useFakeTimers();
+    receiveAgentOpen({ workspaceId: "w3", place, text: null, production: { agentTitle: "A", connectionName: "Live" } });
+    vi.advanceTimersByTime(AGENT_OPEN_KEPT_MS + 1);
+    expect(takeAgentOpen("w3")).toBeNull();
   });
 });
 
