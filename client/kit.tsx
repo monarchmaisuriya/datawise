@@ -3,6 +3,7 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { FlatList, Icon, Modal as HostModal, type ModalContentProps, type ModalProps, ScrollView, TextInput } from "@getpaseo/plugin/client/ui";
 import { createContext, type ReactNode, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
+import { answered, asked, closedConfirm, type ConfirmQuestion, type ConfirmState } from "./confirm-state";
 import { PendingContext } from "./pending";
 import { PreferencesContext } from "./preferences";
 import { BYTES_TAG, bytesSize, type ConnectionColor, type JobView, rpc, type StartResult } from "../shared/contracts";
@@ -410,38 +411,31 @@ function BridgedContent({ children, ...props }: ModalContentProps) {
 
 export const Modal = Object.assign((props: ModalProps) => <HostModal {...props} />, { Content: BridgedContent });
 
-interface ConfirmRequest {
-  title: string;
-  preview: string;
-  reason?: string;
-  actionLabel: string;
-  resolve: (ok: boolean) => void;
-}
-
-const ConfirmContext = createContext<((request: Omit<ConfirmRequest, "resolve">) => Promise<boolean>) | null>(null);
+const ConfirmContext = createContext<((question: ConfirmQuestion) => Promise<boolean>) | null>(null);
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
   const ui = useUi();
-  const [request, setRequest] = useState<ConfirmRequest | null>(null);
-  const ask = useCallback((next: Omit<ConfirmRequest, "resolve">) => new Promise<boolean>((resolve) => setRequest({ ...next, resolve })), []);
+  const [state, setState] = useState<ConfirmState>(closedConfirm);
+  const ask = useCallback((question: ConfirmQuestion) => new Promise<boolean>((resolve) => setState(asked({ ...question, resolve }))), []);
   const answer = (ok: boolean) => {
-    request?.resolve(ok);
-    setRequest(null);
+    state.pending?.resolve(ok);
+    setState(answered);
   };
+  const shown = state.shown;
   return (
     <ConfirmContext.Provider value={ask}>
       {children}
-      <Modal title={request?.title ?? "Confirm"} icon={<Icon name="TriangleAlert" size={16} color={ui.colors.statusWarning} />} open={request !== null} onOpenChange={(open) => (open ? undefined : answer(false))}>
+      <Modal title={shown?.title ?? ""} icon={<Icon name="TriangleAlert" size={16} color={ui.colors.statusWarning} />} open={state.pending !== null} onOpenChange={(open) => (open ? undefined : answer(false))}>
         <Modal.Content>
-          {request?.reason ? <Text style={ui.body}>{request.reason}</Text> : null}
+          {shown?.reason ? <Text style={ui.body}>{shown.reason}</Text> : null}
           <View style={ui.card}>
             <Text selectable style={ui.mono}>
-              {request?.preview}
+              {shown?.preview}
             </Text>
           </View>
           <View style={[ui.row, { justifyContent: "flex-end" }]}>
             <Btn label="Cancel" onPress={() => answer(false)} />
-            <Btn label={request?.actionLabel ?? "Run"} kind="primary" onPress={() => answer(true)} />
+            <Btn label={shown?.actionLabel ?? ""} kind="primary" onPress={() => answer(true)} />
           </View>
         </Modal.Content>
       </Modal>

@@ -8,6 +8,7 @@ import { jumpFilters } from "./foreign-keys";
 import { clampWidth } from "./column-width";
 import { AGENT_OPEN_KEPT_MS, agentActivityEvent, savedView } from "./contracts";
 import { productionQuestion, receiveAgentOpen, takeAgentOpen } from "../client/agent-open";
+import { answered, asked } from "../client/confirm-state";
 import { wholeKey } from "./row-key";
 import { columnRange, groupDigits, hexPreview } from "./grid-display";
 import { toMarkdownTable } from "./markdown";
@@ -171,6 +172,17 @@ describe("an agent's request to open a tab", () => {
     receiveAgentOpen({ workspaceId: "w3", place, text: null, production: { agentTitle: "A", connectionName: "Live" } });
     vi.advanceTimersByTime(AGENT_OPEN_KEPT_MS + 1);
     expect(takeAgentOpen("w3")).toBeNull();
+  });
+});
+
+describe("the confirm dialog", () => {
+  const question = { title: "Open a production connection?", preview: "A wants to open Live.", actionLabel: "Open" };
+  it("closes on an answer but keeps showing its own words while it fades, never a default", () => {
+    const open = asked({ ...question, resolve: () => undefined });
+    expect(open.pending).not.toBeNull();
+    const closing = answered(open);
+    expect(closing.pending).toBeNull();
+    expect(closing.shown).toEqual(question);
   });
 });
 

@@ -4,6 +4,12 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-14
+
+### Fixed
+
+- A confirmation flashed "Confirm" and "Run" while it closed after you answered it, which could look like a second question. It now fades out showing the question you answered.
+
 ## [0.6.0] - 2026-11-14
 
 ### Added
