@@ -3,8 +3,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { visibleText, visibleValue } from "../shared/agent-display";
-import type { AgentRequestItem, AgentRequestSummary, RowKey } from "../shared/contracts";
-import { Btn, errorText, Message, Modal, useApi, useUi } from "./kit";
+import type { AgentRequestItem, AgentRequestSummary, ConnectionProposal, RowKey } from "../shared/contracts";
+import { Btn, errorText, Field, Message, Modal, useApi, useUi } from "./kit";
 
 const POLL_MS = 5000;
 
@@ -13,6 +13,7 @@ function rowsText(count: number): string {
 }
 
 function sizeText(request: AgentRequestSummary): string {
+  if (request.headline) return visibleText(request.headline);
   return request.unit === "statements" ? `run ${request.rows} statement${request.rows === 1 ? "" : "s"}` : `change ${rowsText(request.rows)}`;
 }
 
@@ -58,6 +59,16 @@ function ItemCard({ item }: { item: AgentRequestItem }) {
       </View>
     );
   }
+  if (item.kind === "field") {
+    return (
+      <View style={ui.card}>
+        <Text style={ui.label}>{item.label}</Text>
+        <Text selectable style={ui.mono}>
+          {visibleText(item.value)}
+        </Text>
+      </View>
+    );
+  }
   if (item.kind === "delete") {
     return (
       <View style={[ui.card, { borderColor: ui.colors.statusDanger }]}>
@@ -90,18 +101,21 @@ function ItemCard({ item }: { item: AgentRequestItem }) {
   );
 }
 
-function RequestDetail({ id, onBack }: { id: string; onBack: () => void }) {
+export type ReviewConnection = (requestId: string, connectionId: string | null, values: ConnectionProposal) => void;
+
+function RequestDetail({ id, onBack, onReview }: { id: string; onBack: () => void; onReview: ReviewConnection }) {
   const ui = useUi();
   const api = useApi();
   const client = useQueryClient();
   const detail = useQuery({ queryKey: ["datawise", "agent-request", id], queryFn: () => api.getAgentRequest({ id }), retry: false, gcTime: 0, refetchInterval: 2000 });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [typed, setTyped] = useState("");
   const decide = async (approve: boolean) => {
     setBusy(true);
     setError(null);
     try {
-      await api.decideAgentRequest({ id, approve });
+      await api.decideAgentRequest({ id, approve, confirmName: approve && detail.data?.typeToConfirm ? typed : undefined });
       await client.invalidateQueries({ queryKey: ["datawise", "agent-requests"] });
       await detail.refetch();
     } catch (failure) {
@@ -142,13 +156,23 @@ function RequestDetail({ id, onBack }: { id: string; onBack: () => void }) {
           ))}
           {request.message ? <Message kind={request.status === "failed" ? "error" : "note"} text={request.message} /> : null}
           {error ? <Message kind="error" text={error} /> : null}
+          {request.status === "pending" && detail.data?.typeToConfirm ? (
+            <>
+              <Text style={ui.danger}>This cannot be undone. Type {visibleText(detail.data.typeToConfirm)} to approve.</Text>
+              <Field label="Name" value={typed} onChangeText={setTyped} mono />
+            </>
+          ) : null}
           {request.status === "pending" ? (
             <View style={[ui.row, { justifyContent: "flex-end" }]}>
               <Btn label="Reject" disabled={busy} onPress={() => void decide(false)} />
-              <Btn label={busy ? "Working…" : "Approve"} kind="primary" disabled={busy} onPress={() => void decide(true)} />
+              {request.kind === "connection" ? (
+                <Btn label="Review in form" kind="primary" disabled={busy} onPress={() => onReview(request.id, request.connectionId || null, detail.data?.connectionProposal ?? {})} />
+              ) : (
+                <Btn label={busy ? "Working…" : "Approve"} kind={detail.data?.typeToConfirm ? "danger" : "primary"} disabled={busy || (detail.data?.typeToConfirm ? typed !== detail.data.typeToConfirm : false)} onPress={() => void decide(true)} />
+              )}
             </View>
           ) : (
-            <Message kind={request.status === "done" ? "success" : request.status === "unknown" || request.status === "partial" ? "warning" : "note"} text={request.status === "partial" ? "Some statements ran before one failed, and those stay applied. Check the data." : request.status === "unknown" ? "Datawise lost the database's answer while committing, so this may or may not have landed. Check the table." : `This request is ${request.status}${request.status === "done" ? `: ${rowsText(request.affected ?? 0)} changed` : ""}.`} />
+            <Message kind={request.status === "done" ? "success" : request.status === "unknown" || request.status === "partial" ? "warning" : "note"} text={request.status === "partial" ? "Some statements ran before one failed, and those stay applied. Check the data." : request.status === "unknown" ? "Datawise lost the database's answer while committing, so this may or may not have landed. Check the table." : request.status === "done" && request.headline ? `Done: ${visibleText(request.headline)}.` : `This request is ${request.status}${request.status === "done" ? `: ${rowsText(request.affected ?? 0)} changed` : ""}.`} />
           )}
         </>
       ) : null}
@@ -161,7 +185,7 @@ function RequestRow({ request, onOpen }: { request: AgentRequestSummary; onOpen:
   return (
     <Pressable accessibilityRole="button" accessibilityLabel={`Open request from ${request.agentTitle ?? "an agent"}`} onPress={onOpen} style={[ui.card, { gap: 2 }]}>
       <Text numberOfLines={1} style={ui.body}>
-        {visibleText(request.agentTitle ?? "An agent")}: {request.unit === "statements" ? `${request.rows} statement${request.rows === 1 ? "" : "s"}` : rowsText(request.rows)}, {visibleText(request.place)}
+        {visibleText(request.agentTitle ?? "An agent")}: {request.headline ? visibleText(request.headline) : `${request.unit === "statements" ? `${request.rows} statement${request.rows === 1 ? "" : "s"}` : rowsText(request.rows)}, ${visibleText(request.place)}`}
       </Text>
       <Text numberOfLines={1} style={request.status === "pending" ? ui.warning : ui.muted}>
         {visibleText(request.connectionName)}, {request.status}
@@ -170,7 +194,7 @@ function RequestRow({ request, onOpen }: { request: AgentRequestSummary; onOpen:
   );
 }
 
-export function AgentRequestsModal({ onClose }: { onClose: () => void }) {
+export function AgentRequestsModal({ onClose, onReview }: { onClose: () => void; onReview: ReviewConnection }) {
   const ui = useUi();
   const api = useApi();
   const [openId, setOpenId] = useState<string | null>(null);
@@ -183,7 +207,7 @@ export function AgentRequestsModal({ onClose }: { onClose: () => void }) {
       <Modal.Content scrollable={false} contentContainerStyle={{ padding: 0, gap: 0 }}>
         <ScrollView style={{ flex: 1, minHeight: 0 }} contentContainerStyle={{ padding: 16, gap: 10 }}>
           {openId ? (
-            <RequestDetail id={openId} onBack={() => setOpenId(null)} />
+            <RequestDetail id={openId} onBack={() => setOpenId(null)} onReview={onReview} />
           ) : (
             <>
               {requests.error ? <Message kind="error" text={errorText(requests.error)} /> : null}
@@ -202,7 +226,7 @@ export function AgentRequestsModal({ onClose }: { onClose: () => void }) {
                 keyExtractor={(event, index) => `${event.at}-${index}`}
                 renderItem={({ item: event }) => (
                   <Text numberOfLines={2} style={[ui.muted, { paddingVertical: 2 }]}>
-                    {new Date(event.at).toLocaleString()} · {visibleText(event.agentTitle ?? event.agentId)} · {event.action} · {event.unit === "statements" ? `${event.rows} statement${event.rows === 1 ? "" : "s"}` : rowsText(event.rows)} · {visibleText(event.connectionName)} · {visibleText(event.place)}
+                    {new Date(event.at).toLocaleString()} · {visibleText(event.agentTitle ?? event.agentId)} · {event.action} · {event.change ? visibleText(event.change) : event.unit === "statements" ? `${event.rows} statement${event.rows === 1 ? "" : "s"}` : rowsText(event.rows)} · {visibleText(event.connectionName)} · {visibleText(event.place)}
                   </Text>
                 )}
               />

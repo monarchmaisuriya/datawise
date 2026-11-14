@@ -1,6 +1,7 @@
 import { copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { onAgentView, sameObject } from "./agent-push";
 import { Text, View } from "react-native";
 import type { ColumnInfo, ConnectionView, Filter, ObjectDetails, ObjectRef, RowKey, RowPage, SavedFilter, SavedView, Sort } from "../shared/contracts";
 import { ENGINES, FILTER_LABELS, type FilterOp } from "../shared/engines";
@@ -115,6 +116,13 @@ function DataGrid({ connection, refObject, saved, canSaveView, details, initialF
   const [committing, setCommitting] = useState(false);
 
   // Saved when it changes, and not on opening. A jump's filter is for this visit, so the saved one stays.
+  // An agent's change to how this table is shown, merged into this window's own view.
+  useEffect(() => onAgentView((event) => {
+    if (!sameObject(event.ref, refObject)) return;
+    if (event.hiddenColumns) setHiddenColumns(event.hiddenColumns);
+    if (event.columnOrder) setColumnOrder(event.columnOrder);
+    if (event.sort !== undefined) setSort(event.sort);
+  }), [refObject]);
   const viewNow: SavedView = useMemo(() => {
     const fromJump = initialFilters !== undefined && JSON.stringify(filters) === JSON.stringify(initialFilters);
     return { hiddenColumns, columnOrder, sort, filtersInUse: fromJump ? saved.filtersInUse : filters, filters: savedFilters, columnWidths };

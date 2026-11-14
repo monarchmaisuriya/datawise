@@ -1,12 +1,15 @@
 import { defineAgentTool } from "@getpaseo/plugin/server";
 import { z } from "zod";
 import { agentRowLevel } from "../shared/agent-access";
-import { AGENT_OPEN_KEPT_MS, type AgentOpenEvent, type AgentRequestItem, BYTES_TAG, type Filter, type ObjectInfo, type ObjectRef, type QueryResult, type RowKey, type SavedPlace, type Scope, type Sort, type StagedEdit } from "../shared/contracts";
+import { AGENT_OPEN_KEPT_MS, type AgentEvent, type AgentOpenEvent, type QueryTabs, connectionProposal, type ConnectionProposal, exportFormat, importFormat, type JobView, type AgentRequestItem, BYTES_TAG, type Filter, type ObjectInfo, type ObjectRef, type QueryResult, type RowKey, type SavedPlace, type Scope, type Sort, type StagedEdit } from "../shared/contracts";
 import { ENGINES, type EngineId, FILTER_OPS } from "../shared/engines";
 import type { Adapter, ParsedStatement } from "./adapters/types";
 import { PlanRefused } from "./adapters/sql-base";
+import type { HandlerRegistry } from "./agent-actions";
 import { type AgentRequests, MAX_BYTES, MAX_ROWS } from "./agent-requests";
 import { errorMessage } from "./errors";
+import { readRecords } from "./formats";
+import type { Jobs } from "./jobs";
 import type { Pool } from "./pool";
 import type { Store, StoredConnection } from "./store";
 import { structureOf, structureText } from "./structure";
@@ -44,7 +47,7 @@ const SYSTEM_SCHEMAS = new Set(["information_schema", "pg_catalog", "pg_toast", 
 class Refused extends Error {}
 
 export interface ActivityLog {
-  (event: { agentId: string; agentTitle: string | null; connection: StoredConnection; action: "read" | "proposed"; place: string; rows: number; unit: "rows" | "statements" }): void;
+  (event: { agentId: string; agentTitle: string | null; connection: Pick<StoredConnection, "id" | "name">; action: "read" | "proposed" | "done"; place: string; rows: number; unit: "rows" | "statements"; change?: string }): void;
 }
 
 function firstLine(text: string): string {
@@ -131,6 +134,16 @@ function targetOf(connection: StoredConnection): string {
 
 export const agentTarget = targetOf;
 
+const TEST_EVERY_MS = 10 * 1000;
+// Agent saves stop here, so a looping agent cannot grow the file that also holds the connections without end.
+const SAVED_QUERIES_MAX = 200;
+
+// The approval card's lines for a connection proposal: each proposed value, and the value it replaces.
+function proposalItems(proposal: ConnectionProposal, existing: StoredConnection | null): AgentRequestItem[] {
+  const text = (value: unknown) => (value === null || value === undefined || value === "" ? "(none)" : typeof value === "object" ? JSON.stringify(value) : String(value));
+  return Object.entries(proposal).map(([key, value]) => ({ kind: "field" as const, label: existing ? `${key}, now ${text((existing as Record<string, unknown>)[key])}` : key, value: text(value) }));
+}
+
 // One long statement cannot crowd out the rest of the history.
 function cutText(text: string): string {
   return text.length > CELL_MAX * 8 ? `${text.slice(0, CELL_MAX * 8)} … (cut)` : text;
@@ -157,15 +170,47 @@ function answerFor(error: unknown) {
 // Saves the place where it may, tells every open Paseo window, and returns how many there were.
 export type OpenInTab = (event: AgentOpenEvent) => Promise<number>;
 
-export function createAgentTools(store: Store, pool: Pool, requests: AgentRequests, log: ActivityLog, openInTab: OpenInTab) {
+export function createAgentTools(store: Store, pool: Pool, requests: AgentRequests, log: ActivityLog, openInTab: OpenInTab, { handlers, agentTestFailures, jobs, pushToWindows }: { handlers: HandlerRegistry; agentTestFailures: Set<string>; jobs: Jobs; pushToWindows: (event: AgentEvent) => Promise<number> }) {
   const shared = async () => (await store.listConnections()).filter(agentMayRead);
   // The same answer whether it does not exist, is not shared, or does not allow this, so the tool reveals none.
-  const withLevel = async (name: string, level: "read" | "propose") => {
+  const withLevel = async (name: string, level: "names" | "read" | "propose") => {
     const connection = (await shared()).find((item) => item.name === name);
-    const allowed = connection && (level === "read" ? agentRowLevel(connection) !== "none" : agentRowLevel(connection) === "propose");
+    const allowed = connection && (level === "names" ? true : level === "read" ? agentRowLevel(connection) !== "none" : agentRowLevel(connection) === "propose");
     if (!connection || !allowed) throw new Refused(`No connection named ${name} allows this.`);
     return connection;
   };
+  // Any connection the person has, shared or not, except production: for actions on the connection itself.
+  const anyConnection = async (name: string) => {
+    const connection = (await store.listConnections()).find((item) => item.name === name && item.environment !== "production");
+    if (!connection) throw new Refused(`No connection named ${name} allows this.`);
+    return connection;
+  };
+  // Stores an app action that runs, once the person approves, through the handler the app calls. Its input is
+  // parsed now by that action's own contract, so a request that could never run is refused at once.
+  const proposeAction = (agent: { id: string; title: string | null }, connection: StoredConnection, place: string, ref: ObjectRef, name: string, input: unknown, items: AgentRequestItem[], extra: { headline: string; mayBePartial?: boolean; expectedText?: string }) => {
+    const limit = requests.limitReached(connection.id, agent.id);
+    if (limit) throw new Refused(limit);
+    const request = requests.add({
+      agentId: agent.id,
+      agentTitle: agent.title,
+      connectionId: connection.id,
+      connectionName: connection.name,
+      environment: connection.environment,
+      place,
+      ref,
+      target: targetOf(connection),
+      items,
+      inserts: null,
+      edits: null,
+      statements: null,
+      mayBePartial: extra.mayBePartial ?? false,
+      action: { name, input: handlers.parse(name, input), expectedText: extra.expectedText },
+      headline: extra.headline,
+    });
+    log({ agentId: agent.id, agentTitle: agent.title, connection, action: "proposed", place, rows: request.rows, unit: "rows", change: extra.headline });
+    return { text: `Request ${request.id} is waiting. Nothing has run. Tell the person to open Datawise and review it. It expires in 30 minutes. Check it with datawise_write_status.`, structuredContent: { requestId: request.id, status: request.status } };
+  };
+  const lastTest = new Map<string, number>();
   const calls = new Map<string, number[]>();
   const spend = (agentId: string) => {
     const now = Date.now();
@@ -209,15 +254,27 @@ export function createAgentTools(store: Store, pool: Pool, requests: AgentReques
       table: z.string().optional().describe("Table name"),
       database: z.string().optional(),
       schema: z.string().optional(),
+      list: z.enum(["tables", "databases", "schemas"]).default("tables").describe("What to list when no table is named"),
     }),
-    async execute({ connection: name, table, database, schema }) {
+    async execute({ connection: name, table, database, schema, list }) {
       try {
         const connections = await shared();
         if (!name) return { text: `${NOTE}\n\nConnections:\n${connections.map((item) => `- ${item.name} (${ENGINES[item.engine].label})`).join("\n") || "none shared"}` };
         const connection = connections.find((item) => item.name === name);
         if (!connection) return { text: `No shared connection named ${name}.`, isError: true };
         return await pool.use(connection.id, async (adapter) => {
+          if (!table && list === "databases") {
+            const info = ENGINES[connection.engine];
+            if (!info.databaseLabel) return { text: `${info.label} has no databases to list here.` };
+            const names = connection.database ? [connection.database] : (await adapter.listDatabases()).filter((item) => !isSystemDatabase(connection.engine, item) && !SQL_SERVER_SYSTEM_DATABASES.has(item.toLowerCase()));
+            return { text: `${NOTE}\n\n${names.map((item) => `- ${item}`).join("\n") || "no databases"}` };
+          }
           const scope = await resolveScope(adapter, connection, database, schema);
+          if (!table && list === "schemas") {
+            if (!ENGINES[connection.engine].schemaLabel) return { text: `${ENGINES[connection.engine].label} has no schemas to list here.` };
+            const names = (await adapter.listSchemas({ connectionId: scope.connectionId, database: scope.database })).filter((item) => !SYSTEM_SCHEMAS.has(item.toLowerCase()));
+            return { text: `${NOTE}\n\n${names.map((item) => `- ${item}`).join("\n") || "no schemas"}` };
+          }
           if (table) {
             await resolveObject(adapter, connection.engine, scope, table);
             return { text: `${NOTE}\n\n${structureText(structureOf(await adapter.describe({ ...scope, name: table })))}` };
@@ -569,16 +626,16 @@ export function createAgentTools(store: Store, pool: Pool, requests: AgentReques
   const writeStatus = defineAgentTool({
     name: "datawise_write_status",
     title: "Check a proposed change",
-    description: "Says what happened to a change proposed with datawise_propose_write or datawise_propose_query.",
+    description: "Says what happened to anything you proposed with a datawise_propose_ tool.",
     input: z.object({ requestId: z.string() }),
     execute({ requestId }, context) {
       const request = requests.forAgent(requestId, context.agent.id);
       if (!request) return { text: "Datawise has no such request. It may have restarted, and a change that was approved may or may not have landed. Read the table before proposing again.", isError: true };
       const texts: Record<typeof request.status, string> = {
-        pending: "Waiting for the person. Nothing has been written.",
+        pending: request.kind === "connection" ? "Waiting for the person to review the connection and type any password. Nothing is saved yet." : "Waiting for the person. Nothing has been written.",
         running: "Approved and being written.",
-        done: `Done. Rows changed: ${request.affected ?? 0}.`,
-        failed: request.mayBePartial ? "The change failed. It may have partly applied. Read the data before proposing again." : "The change failed, and nothing was written. The person can see why in Datawise.",
+        done: request.kind === "connection" ? `The person saved the connection ${request.connectionName}. Open it with datawise_open.` : request.kind === "action" ? `Done.${request.affected === null ? "" : ` Rows: ${request.affected}.`}` : `Done. Rows changed: ${request.affected ?? 0}.`,
+        failed: request.mayBePartial ? "The change failed. It may have partly applied. Read the data before proposing again." : request.kind === "action" ? "It failed. The person can see why in Datawise." : "The change failed, and nothing was written. The person can see why in Datawise.",
         partial: `${request.ran ?? "Some"} of ${request.statements?.length ?? "the"} statements ran before one failed; those stay applied. Read the data before proposing again. The person can see why in Datawise.`,
         unknown: "Datawise lost the database's answer while committing, so this may or may not have landed. Read the table before proposing again.",
         rejected: "The person said no. Nothing was written.",
@@ -588,5 +645,429 @@ export function createAgentTools(store: Store, pool: Pool, requests: AgentReques
     },
   });
 
-  return [open, describe, read, count, query, explain, history, proposeWrite, proposeQuery, writeStatus];
+  const proposeDisconnect = defineAgentTool({
+    name: "datawise_propose_disconnect",
+    title: "Propose closing a connection",
+    description: "Asks the person to close the open session of a Datawise connection, on any connection they have except production. Nothing closes until they approve in Datawise, and it is refused while a query or other job runs on it. Check it with datawise_write_status.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name") }),
+    async execute({ connection: name }, context) {
+      try {
+        const connection = await anyConnection(name);
+        return proposeAction(context.agent, connection, connection.name, { connectionId: connection.id, name: "" }, "connections.disconnect", { id: connection.id }, [{ kind: "field", label: "Close the open session of", value: connection.name }], { headline: `close the open session of ${connection.name}` });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeConnection = defineAgentTool({
+    name: "datawise_propose_connection",
+    title: "Propose a new connection",
+    description: "Proposes a new Datawise connection, without any password, key or API key. The person reviews it in the connection form, types the secret there, may choose its label, sharing and write mode, and saves it; nothing is saved before that. A new connection is not shared with agents unless the person shares it. Once saved, open it with datawise_open. Check it with datawise_write_status.",
+    input: connectionProposal.required({ name: true, engine: true }),
+    async execute(proposal, context) {
+      try {
+        if ((await store.listConnections()).some((item) => item.name === proposal.name)) throw new Refused(`A connection is already named ${proposal.name}. Choose another name.`);
+        const limit = requests.limitReached("", context.agent.id);
+        if (limit) throw new Refused(limit);
+        const request = requests.add({
+          agentId: context.agent.id,
+          agentTitle: context.agent.title,
+          connectionId: "",
+          connectionName: proposal.name,
+          environment: "none",
+          place: proposal.name,
+          ref: { connectionId: "", name: "" },
+          target: "",
+          items: proposalItems(proposal, null),
+          inserts: null,
+          edits: null,
+          statements: null,
+          mayBePartial: false,
+          connectionProposal: proposal,
+          headline: `add the connection ${proposal.name}`,
+        });
+        log({ agentId: context.agent.id, agentTitle: context.agent.title, connection: { id: "", name: proposal.name }, action: "proposed", place: proposal.name, rows: 0, unit: "rows", change: `add the connection ${proposal.name}` });
+        return { text: `Request ${request.id} is waiting. Nothing is saved. Tell the person to open Datawise, review the connection and type its password there. Check it with datawise_write_status.`, structuredContent: { requestId: request.id, status: request.status } };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeConnectionChange = defineAgentTool({
+    name: "datawise_propose_connection_change",
+    title: "Propose changing a connection",
+    description: "Proposes new settings for a Datawise connection the person has, except production, without any secret. The person reviews the change in the connection form and saves it; nothing changes before that. A change to where the connection points (host, port, user, database, file, TLS, SSH) clears its saved secrets and its sharing with agents, so the person types the password again. Check it with datawise_write_status.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name"), changes: connectionProposal }),
+    async execute({ connection: name, changes }, context) {
+      try {
+        const connection = await anyConnection(name);
+        const changed = Object.fromEntries(Object.entries(changes).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify((connection as Record<string, unknown>)[key]))) as ConnectionProposal;
+        if (Object.keys(changed).length === 0) throw new Refused("These are already the connection's settings.");
+        if (changed.name && (await store.listConnections()).some((item) => item.id !== connection.id && item.name === changed.name)) throw new Refused(`A connection is already named ${changed.name}. Choose another name.`);
+        const limit = requests.limitReached(connection.id, context.agent.id);
+        if (limit) throw new Refused(limit);
+        const request = requests.add({
+          agentId: context.agent.id,
+          agentTitle: context.agent.title,
+          connectionId: connection.id,
+          connectionName: connection.name,
+          environment: connection.environment,
+          place: connection.name,
+          ref: { connectionId: connection.id, name: "" },
+          target: targetOf(connection),
+          items: proposalItems(changed, connection),
+          inserts: null,
+          edits: null,
+          statements: null,
+          mayBePartial: false,
+          connectionProposal: changed,
+          headline: `change the connection ${connection.name}`,
+        });
+        log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "proposed", place: connection.name, rows: 0, unit: "rows", change: `change the connection ${connection.name}` });
+        return { text: `Request ${request.id} is waiting. Nothing has changed. Tell the person to open Datawise and review the change. Check it with datawise_write_status.`, structuredContent: { requestId: request.id, status: request.status } };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeResetSshKey = defineAgentTool({
+    name: "datawise_propose_reset_ssh_key",
+    title: "Propose forgetting a connection's SSH host key",
+    description: "Asks the person to forget the SSH host key Datawise pinned for a connection, for example after the SSH server's key was replaced. The next connection then trusts the key it is shown. Nothing changes until the person approves in Datawise. Check it with datawise_write_status.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name") }),
+    async execute({ connection: name }, context) {
+      try {
+        const connection = await anyConnection(name);
+        if (!connection.ssh) throw new Refused(`${name} does not connect through SSH.`);
+        return proposeAction(context.agent, connection, connection.name, { connectionId: connection.id, name: "" }, "connections.clear-ssh-fingerprint", { id: connection.id }, [
+          { kind: "field", label: "Forget the SSH host key of", value: connection.name },
+          { kind: "field", label: "After this", value: "The next connection trusts the SSH host key it is shown." },
+        ], { headline: `forget the SSH host key of ${connection.name}` });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const testConnection = defineAgentTool({
+    name: "datawise_test_connection",
+    title: "Test a connection",
+    description: "Tests whether Datawise can connect to a connection the person has, except production, with its saved settings. Answers only whether it connected. After a failed test it is not tested again until the person tests or saves it, so a database account is not locked by repeated sign-ins.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name") }),
+    async execute({ connection: name }, context) {
+      try {
+        const connection = await anyConnection(name);
+        if (connection.password === null && !connection.rememberPassword) throw new Refused("This connection keeps its password for the session only, and it has not been entered. Ask the person to open it.");
+        if (agentTestFailures.has(connection.id)) throw new Refused("The last test of this connection failed. Datawise tests it again only after the person tests or saves it.");
+        const now = Date.now();
+        if (now - (lastTest.get(connection.id) ?? 0) < TEST_EVERY_MS) throw new Refused("Wait 10 seconds between tests of one connection.");
+        lastTest.set(connection.id, now);
+        spend(context.agent.id);
+        const result = (await handlers.call("connections.test", connection)) as { ok: boolean };
+        log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "read", place: connection.name, rows: 0, unit: "rows" });
+        if (result.ok) return { text: "Connected." };
+        agentTestFailures.add(connection.id);
+        return { text: "Could not connect. The person can see why by testing it in Datawise.", isError: true };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const readRow = defineAgentTool({
+    name: "datawise_read_row",
+    title: "Read one row",
+    description: "Reads the row with the given key from a table on a connection the person opened to agents for reading rows. The key names every key column and its value.",
+    input: z.object({ ...scopePart, table: z.string().max(200).describe("Table name"), key: z.record(z.string().max(200), z.union([z.string(), z.number(), z.boolean()])).describe("Key column name -> value") }),
+    async execute({ connection: name, table, database, schema, key }, context) {
+      try {
+        const connection = await withLevel(name, "read");
+        spend(context.agent.id);
+        return await pool.use(connection.id, async (adapter) => {
+          const scope = await resolveScope(adapter, connection, database, schema);
+          await resolveObject(adapter, connection.engine, scope, table);
+          const ref = { ...scope, name: table };
+          // A read with the key as filters, so it takes the same isolated, read-only path as datawise_read.
+          const page = await adapter.readIsolated(ref, { limit: 2, cursor: null, sort: null, filters: Object.entries(key).map(([column, value]) => ({ column, op: "eq" as const, value: String(value) })) }, CELL_MAX);
+          if (page.rows.length > 1) throw new Refused("That key matches more than one row. Name every key column.");
+          log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "read", place: placeOf(ref), rows: page.rows.length, unit: "rows" });
+          if (page.rows.length === 0) return { text: "No row has that key." };
+          const names = page.columns.map((column) => column.name);
+          return { text: `${ROW_NOTE}\n\n${JSON.stringify({ columns: names, row: page.rows[0], cutValues: page.cutCells.map(([, column]) => names[column]) })}` };
+        });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeDestroy = defineAgentTool({
+    name: "datawise_propose_destroy",
+    title: "Propose deleting a table or all its rows",
+    description: "Proposes deleting a table (drop) or removing all its rows (truncate), on a connection the person opened to agents for proposals. Nothing happens until the person types the table's name and approves in Datawise. Check it with datawise_write_status.",
+    input: z.object({ ...scopePart, table: z.string().max(200).describe("Table name"), action: z.enum(["drop", "truncate"]) }),
+    async execute({ connection: name, table, database, schema, action }, context) {
+      try {
+        const connection = await withLevel(name, "propose");
+        return await pool.use(connection.id, async (adapter) => {
+          const scope = await resolveScope(adapter, connection, database, schema);
+          await resolveObject(adapter, connection.engine, scope, table);
+          const ref = { ...scope, name: table };
+          // The name is left empty here on purpose: only the person's typing on the approval card fills it.
+          return proposeAction(context.agent, connection, placeOf(ref), ref, "data.destroy", { ref, action, confirmName: "" }, [{ kind: "field", label: action === "drop" ? "Delete this table and everything in it" : "Remove every row of this table", value: placeOf(ref) }], { headline: action === "drop" ? `delete the table ${placeOf(ref)}` : `remove every row of ${placeOf(ref)}` });
+        });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeImport = defineAgentTool({
+    name: "datawise_propose_import",
+    title: "Propose importing rows",
+    description: `Proposes importing rows given as text (CSV, TSV, JSON or NDJSON, up to ${MAX_BYTES / 1024} KiB) into a table, on a connection the person opened to agents for proposals. The mapping names, for each table column, the source column it takes. Nothing is written until the person approves in Datawise. Check it with datawise_write_status.`,
+    input: z.object({ ...scopePart, table: z.string().max(200).describe("Table name"), format: importFormat, text: z.string().min(1).max(MAX_BYTES), mapping: z.record(z.string().max(200), z.string().max(200)).describe("Table column -> source column") }),
+    async execute({ connection: name, table, database, schema, format, text, mapping }, context) {
+      try {
+        const connection = await withLevel(name, "propose");
+        if (Object.keys(mapping).length === 0) throw new Refused("Map at least one column.");
+        if (Buffer.byteLength(text) > MAX_BYTES) throw new Refused(`Send at most ${MAX_BYTES / 1024} KiB of text.`);
+        const records: Record<string, unknown>[] = [];
+        let total = 0;
+        for await (const record of readRecords({ text }, format)) {
+          total += 1;
+          if (records.length < 20) records.push(record);
+        }
+        if (total === 0) throw new Refused("The text has no rows.");
+        return await pool.use(connection.id, async (adapter) => {
+          const scope = await resolveScope(adapter, connection, database, schema);
+          await resolveObject(adapter, connection.engine, scope, table);
+          const ref = { ...scope, name: table };
+          return proposeAction(
+            context.agent,
+            connection,
+            placeOf(ref),
+            ref,
+            "import.start",
+            { ref, source: { text }, options: { format, mapping }, confirmed: false },
+            [
+              { kind: "field", label: "Import into", value: placeOf(ref) },
+              { kind: "field", label: "Columns (table <- source)", value: Object.entries(mapping).map(([target, source]) => `${target} <- ${source}`).join("\n") },
+              { kind: "field", label: "Rows", value: String(total) },
+              { kind: "field", label: total > records.length ? `The first ${records.length} rows` : "The rows", value: records.map((record) => JSON.stringify(record)).join("\n") },
+            ],
+            { headline: `import ${total} row${total === 1 ? "" : "s"} into ${placeOf(ref)}`, mayBePartial: !ENGINES[connection.engine].transactionalImport },
+          );
+        });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  // A table, or read statements, on one connection: what an export reads.
+  const exportSourceFor = async (connection: StoredConnection, adapter: Adapter, input: { database?: string; schema?: string; table?: string; query?: string }) => {
+    const scope = await resolveScope(adapter, connection, input.database, input.schema);
+    if (input.table && input.query) throw new Refused("Name a table or give a query, not both.");
+    if (input.table) {
+      await resolveObject(adapter, connection.engine, scope, input.table);
+      return { source: { kind: "object" as const, ref: { ...scope, name: input.table }, sort: null, filters: [] }, place: placeOf({ ...scope, name: input.table }) };
+    }
+    if (!input.query) throw new Refused("Name a table or give a query.");
+    await readsOnly(adapter, input.query);
+    return { source: { kind: "query" as const, scope, text: input.query }, place: placeOf({ ...scope, name: "" }) || connection.name };
+  };
+  const exportPart = { ...scopePart, table: z.string().max(200).optional(), query: z.string().max(MAX_TEXT).optional(), format: exportFormat };
+
+  const proposeExport = defineAgentTool({
+    name: "datawise_propose_export",
+    title: "Propose exporting to a file",
+    description: "Proposes exporting a table, or the result of read statements, to a new file in the person's Datawise export folder, on a connection the person opened to agents for reading rows. Give a file name only, no folder; the format sets the extension. Nothing is written until the person approves in Datawise. Check it with datawise_write_status.",
+    input: z.object({ ...exportPart, fileName: z.string().min(1).max(80).describe("File name only, letters, digits, dot, dash and underscore") }),
+    async execute({ connection: name, database, schema, table, query, format, fileName }, context) {
+      try {
+        if (!/^[A-Za-z0-9._-]+$/.test(fileName) || fileName.startsWith(".")) throw new Refused("Give a file name only: letters, digits, dot, dash and underscore, not starting with a dot, and no folder.");
+        const connection = await withLevel(name, "read");
+        return await pool.use(connection.id, async (adapter) => {
+          const { source, place } = await exportSourceFor(connection, adapter, { database, schema, table, query });
+          const { path } = (await handlers.call("export.default-path", { name: fileName, format })) as { path: string };
+          return proposeAction(context.agent, connection, place, { connectionId: connection.id, name: table ?? "" }, "export.start", { source, format, path }, [
+            { kind: "field", label: "Export", value: table ? place : (query as string) },
+            { kind: "field", label: "To this new file", value: path },
+          ], { headline: `export ${table ? place : "a query"} to a file` });
+        });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const exportText = defineAgentTool({
+    name: "datawise_export_text",
+    title: "Export as text",
+    description: "Returns a table, or the result of read statements, as CSV, TSV, JSON, NDJSON or SQL inserts, on a connection the person opened to agents for reading rows. At most 256 KiB; stops after 25 seconds.",
+    input: z.object(exportPart),
+    async execute({ connection: name, database, schema, table, query, format }, context) {
+      try {
+        const connection = await withLevel(name, "read");
+        spend(context.agent.id);
+        const { source, place } = await pool.use(connection.id, (adapter) => exportSourceFor(connection, adapter, { database, schema, table, query }));
+        const started = (await handlers.call("export.text", { source, format })) as JobView;
+        const deadline = new Promise<"late">((resolve) => setTimeout(() => resolve("late"), AGENT_DEADLINE_MS).unref());
+        const finished = await Promise.race([jobs.wait(started.id), deadline]);
+        if (finished === "late") {
+          jobs.cancel(started.id);
+          throw new Refused(TOO_LONG);
+        }
+        if (finished.status !== "done" || finished.text === null) throw new Error(finished.error ?? "The export did not finish.");
+        if (Buffer.byteLength(finished.text) > ANSWER_MAX || finished.truncated) throw new Refused("This export is larger than 256 KiB. Export fewer rows, or use datawise_propose_export to write a file.");
+        log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "read", place, rows: finished.rows, unit: "rows" });
+        return { text: `${ROW_NOTE}\n\n${finished.text}` };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  // An app-only change made at once, recorded so the person can see what an agent changed without asking.
+  const logChange = (agent: { id: string; title: string | null }, connection: StoredConnection, place: string, change: string) => log({ agentId: agent.id, agentTitle: agent.title, connection, action: "done", place, rows: 0, unit: "rows", change });
+
+  const saveQuery = defineAgentTool({
+    name: "datawise_save_query",
+    title: "Save a query",
+    description: "Saves query text under a new name on a connection the person shared with agents, so the person can run it later from Datawise. Never replaces a saved query: a name already used is refused.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name"), name: z.string().trim().min(1).max(120), text: z.string().min(1).max(MAX_TEXT) }),
+    async execute({ connection: name, name: queryName, text }, context) {
+      try {
+        const connection = await withLevel(name, "names");
+        spend(context.agent.id);
+        const existing = await store.listSaved(connection.id);
+        if (existing.length >= SAVED_QUERIES_MAX) throw new Refused(`This connection already has ${SAVED_QUERIES_MAX} saved queries. An agent saves no more.`);
+        if (existing.some((item) => item.name === queryName)) throw new Refused(`A saved query is already named ${queryName}. Choose another name; an agent never replaces a saved query.`);
+        await handlers.call("saved.save", { connectionId: connection.id, name: queryName, text });
+        logChange(context.agent, connection, connection.name, `saved query ${queryName}`);
+        return { text: `Saved ${queryName}.` };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const proposeDeleteSavedQuery = defineAgentTool({
+    name: "datawise_propose_delete_saved_query",
+    title: "Propose deleting a saved query",
+    description: "Asks the person to delete a saved query, by its exact name, on a connection they shared with agents. Nothing is deleted until they approve in Datawise. Check it with datawise_write_status.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name"), name: z.string().min(1).max(120) }),
+    async execute({ connection: name, name: queryName }, context) {
+      try {
+        const connection = await withLevel(name, "names");
+        const matches = (await store.listSaved(connection.id)).filter((item) => item.name === queryName);
+        if (matches.length === 0) throw new Refused(`No saved query is named ${queryName}.`);
+        if (matches.length > 1) throw new Refused(`More than one saved query is named ${queryName}, so Datawise cannot tell which one you mean.`);
+        const saved = matches[0] as { id: string; name: string; text: string };
+        return proposeAction(context.agent, connection, connection.name, { connectionId: connection.id, name: "" }, "saved.delete", { connectionId: connection.id, id: saved.id }, [
+          { kind: "field", label: "Delete the saved query", value: saved.name },
+          { kind: "field", label: "Its text", value: saved.text },
+        ], { headline: `delete the saved query ${saved.name}`, expectedText: saved.text });
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const clearHistory = defineAgentTool({
+    name: "datawise_clear_history",
+    title: "Clear query history",
+    description: "Clears the query history of a connection the person shared with agents. Saved queries are kept.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name") }),
+    async execute({ connection: name }, context) {
+      try {
+        const connection = await withLevel(name, "names");
+        spend(context.agent.id);
+        await handlers.call("history.clear", { connectionId: connection.id });
+        logChange(context.agent, connection, connection.name, "cleared history");
+        return { text: "Cleared the connection's query history." };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const queryTabs = defineAgentTool({
+    name: "datawise_query_tabs",
+    title: "List, rename or close query tabs",
+    description: "Lists the query tabs of a connection the person shared with agents (names and ids, never their text), renames one, or closes one. A tab whose text is saved nowhere else is never closed, and open Datawise windows keep a tab the person typed in since. Open a new tab with text using datawise_open.",
+    input: z.object({ connection: z.string().max(120).describe("Connection name"), action: z.enum(["list", "rename", "close"]), tabId: z.string().max(200).optional(), name: z.string().trim().min(1).max(60).optional() }),
+    async execute({ connection: name, action, tabId, name: tabName }, context) {
+      try {
+        const connection = await withLevel(name, "names");
+        spend(context.agent.id);
+        const { tabs } = (await handlers.call("workspace.tabs.get", { connectionId: connection.id })) as { tabs: QueryTabs | null };
+        if (action === "list") log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "read", place: connection.name, rows: 0, unit: "rows" });
+        if (action === "list") return { text: JSON.stringify((tabs?.tabs ?? []).map((tab) => ({ id: tab.id, name: tab.name }))) };
+        const tab = tabs?.tabs.find((item) => item.id === tabId);
+        if (!tabs || !tab) throw new Refused("No tab has that id. List the tabs first.");
+        if (action === "rename") {
+          if (!tabName) throw new Refused("Give the new name.");
+          await handlers.call("workspace.tabs.save", { connectionId: connection.id, tabs: { ...tabs, tabs: tabs.tabs.map((item) => (item.id === tab.id ? { ...item, name: tabName } : item)) } });
+          await pushToWindows({ kind: "tabs", connectionId: connection.id, renamed: [{ id: tab.id, name: tabName }], closed: [] });
+          logChange(context.agent, connection, connection.name, `renamed tab ${tab.name} to ${tabName}`);
+          return { text: `Renamed the tab to ${tabName}.` };
+        }
+        if (tabs.tabs.length === 1) throw new Refused("This is the connection's last tab, so it stays.");
+        const saved = await store.listSaved(connection.id);
+        if (tab.text.trim() !== "" && !saved.some((item) => item.text === tab.text)) throw new Refused("This tab holds text that is saved nowhere else, so it stays. Save it with datawise_save_query first.");
+        const rest = tabs.tabs.filter((item) => item.id !== tab.id);
+        await handlers.call("workspace.tabs.save", { connectionId: connection.id, tabs: { activeId: tabs.activeId === tab.id ? (rest[0] as { id: string }).id : tabs.activeId, tabs: rest } });
+        await pushToWindows({ kind: "tabs", connectionId: connection.id, renamed: [], closed: [{ id: tab.id, text: tab.text }] });
+        logChange(context.agent, connection, connection.name, `closed tab ${tab.name}`);
+        return { text: `Closed the tab ${tab.name}. An open window keeps it if the person typed in it since.` };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  const tableView = defineAgentTool({
+    name: "datawise_table_view",
+    title: "Read or change how a table is shown",
+    description: "Reads or changes which columns of a table are hidden, their order, and the sort, on a connection the person shared with agents. Saved filters are left as they are and never returned. Open Datawise windows show the change at once.",
+    input: z.object({
+      ...scopePart,
+      table: z.string().max(200).describe("Table name"),
+      action: z.enum(["get", "set"]),
+      hiddenColumns: z.array(z.string().max(200)).max(500).optional(),
+      columnOrder: z.array(z.string().max(200)).max(500).optional(),
+      sort: z.object({ column: z.string().min(1).max(200), descending: z.boolean().default(false) }).nullable().optional(),
+    }),
+    async execute({ connection: name, database, schema, table, action, hiddenColumns, columnOrder, sort: order }, context) {
+      try {
+        const connection = await withLevel(name, "names");
+        spend(context.agent.id);
+        const ref = await pool.use(connection.id, async (adapter) => {
+          const scope = await resolveScope(adapter, connection, database, schema);
+          await resolveObject(adapter, connection.engine, scope, table);
+          return { ...scope, name: table };
+        });
+        const current = (await handlers.call("views.get", ref)) as { hiddenColumns: string[]; columnOrder: string[]; sort: Sort | null };
+        if (action === "get") {
+          log({ agentId: context.agent.id, agentTitle: context.agent.title, connection, action: "read", place: placeOf(ref), rows: 0, unit: "rows" });
+          return { text: JSON.stringify({ hiddenColumns: current.hiddenColumns, columnOrder: current.columnOrder, sort: current.sort }) };
+        }
+        const changes = { ...(hiddenColumns ? { hiddenColumns } : {}), ...(columnOrder ? { columnOrder } : {}), ...(order !== undefined ? { sort: order } : {}) };
+        if (Object.keys(changes).length === 0) throw new Refused("Give hidden columns, a column order or a sort to set.");
+        await handlers.call("views.save", { ref, view: { ...current, ...changes } });
+        await pushToWindows({ kind: "view", ref, ...changes });
+        logChange(context.agent, connection, placeOf(ref), "changed how the table is shown");
+        return { text: "Changed. Open Datawise windows show it now." };
+      } catch (error) {
+        return answerFor(error);
+      }
+    },
+  });
+
+  return [open, describe, read, count, query, explain, history, proposeWrite, proposeQuery, writeStatus, proposeDisconnect, proposeConnection, proposeConnectionChange, proposeResetSshKey, testConnection, readRow, proposeDestroy, proposeImport, proposeExport, exportText, saveQuery, proposeDeleteSavedQuery, clearHistory, queryTabs, tableView];
 }

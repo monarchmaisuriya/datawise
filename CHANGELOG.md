@@ -4,6 +4,18 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-14
+
+### Added
+
+- An agent tool for every Datawise action, except those listed as never for agents in OVERVIEW. 15 new tools: propose a new connection or a change to one, propose closing a session or forgetting an SSH host key, test a connection, read one row, list databases and schemas, propose dropping or emptying a table, importing rows given as text, exporting to a file, or deleting a saved query, export as text, save a query, clear history, list, rename or close query tabs, and read or set how a table is shown.
+- Agent-proposed connections are approved by saving the connection form, filled in, where you type the secret. A proposal never carries a password, a label, sharing or a write mode.
+
+### Changed
+
+- Agent requests and the activity log name what each action or connection request does, such as "add the connection Team PG", and what an agent changed at once, such as "cleared history". `agent-activity.json` gains an optional `change` field; an older Datawise ignores it.
+- A change an agent proposes that moves where a connection points drops its saved secrets and its sharing when you save it.
+
 ## [0.6.1] - 2026-11-14
 
 ### Fixed

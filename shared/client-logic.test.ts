@@ -6,9 +6,11 @@ import { ENGINE_IDS } from "./engines";
 import { visibleText, visibleValue } from "./agent-display";
 import { jumpFilters } from "./foreign-keys";
 import { clampWidth } from "./column-width";
-import { AGENT_OPEN_KEPT_MS, agentActivityEvent, savedView } from "./contracts";
+import { AGENT_OPEN_KEPT_MS, agentActivityEvent, agentEvent, agentOpenEvent, savedView } from "./contracts";
 import { productionQuestion, receiveAgentOpen, takeAgentOpen } from "../client/agent-open";
 import { answered, asked } from "../client/confirm-state";
+import { movesSecrets, proposalNote } from "../client/proposal-note";
+import { applyAgentTabs } from "../client/agent-push";
 import { wholeKey } from "./row-key";
 import { columnRange, groupDigits, hexPreview } from "./grid-display";
 import { toMarkdownTable } from "./markdown";
@@ -183,6 +185,45 @@ describe("the confirm dialog", () => {
     const closing = answered(open);
     expect(closing.pending).toBeNull();
     expect(closing.shown).toEqual(question);
+  });
+});
+
+describe("an agent's connection proposal in the form", () => {
+  it("knows when a proposal moves where the saved password would go", () => {
+    expect(movesSecrets({ host: "b.example" }, { host: "a.example" } as never)).toBe(true);
+    expect(movesSecrets({ host: "a.example", group: "Team" }, { host: "a.example", group: "" } as never)).toBe(false);
+    expect(movesSecrets({ ssh: { host: "jump", port: 22, user: "u" } }, { ssh: null } as never)).toBe(true);
+    expect(movesSecrets({ host: "b.example" }, null)).toBe(false);
+  });
+  it("lists the host first, with the value each proposal replaces, and shows hidden characters as codes", () => {
+    const note = proposalNote({ port: 6543, host: "evil\u202e.example" }, { host: "db.example", port: 5432 } as never);
+    expect(note.split("\n").slice(1)).toEqual(["host: evil\\u{202e}.example (now db.example)", "port: 6543 (now 5432)"]);
+  });
+});
+
+describe("an agent's change to a window's query tabs", () => {
+  const state = { activeId: "a", tabs: [{ id: "a", name: "One", text: "select 1" }, { id: "b", name: "Two", text: "" }] };
+  it("renames, and closes a tab only while its text is what the server saw", () => {
+    expect(applyAgentTabs(state, { kind: "tabs", connectionId: "c", renamed: [{ id: "b", name: "New" }], closed: [] }).tabs.map((tab) => tab.name)).toEqual(["One", "New"]);
+    expect(applyAgentTabs(state, { kind: "tabs", connectionId: "c", renamed: [], closed: [{ id: "a", text: "" }] }).tabs).toHaveLength(2);
+    expect(applyAgentTabs(state, { kind: "tabs", connectionId: "c", renamed: [], closed: [{ id: "a", text: "select 1" }] })).toEqual({ activeId: "b", tabs: [{ id: "b", name: "Two", text: "" }] });
+  });
+  it("never closes the last tab", () => {
+    expect(applyAgentTabs(state, { kind: "tabs", connectionId: "c", renamed: [], closed: [{ id: "a", text: "select 1" }, { id: "b", text: "" }] })).toBe(state);
+  });
+});
+
+describe("events to open windows", () => {
+  const tabs = { kind: "tabs", connectionId: "c", renamed: [], closed: [] };
+  const open = { workspaceId: "w", place: { connectionId: "c", object: null, tab: "data" }, text: null, production: null };
+  it("parse as tab, view or open events, and an open event keeps its old shape", () => {
+    expect(agentEvent.parse(tabs)).toMatchObject({ kind: "tabs" });
+    expect(agentEvent.parse({ kind: "view", ref: { connectionId: "c", name: "t" }, sort: null })).toMatchObject({ kind: "view" });
+    expect(agentEvent.parse(open)).not.toHaveProperty("kind");
+  });
+  it("are refused by a window still on the old schema, whose subscription then closes and reopens after 5 seconds", () => {
+    expect(agentOpenEvent.safeParse(tabs).success).toBe(false);
+    expect(agentOpenEvent.safeParse(open).success).toBe(true);
   });
 });
 

@@ -1,9 +1,14 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { setDriverRoot } from "./drivers";
 import { contributeServer } from "./plugin";
+
+// Drivers load from this checkout's node_modules, as the conformance script does; there is no Paseo to ask.
+setDriverRoot(join(__dirname, ".."));
 
 type Tool = { name: string; input: { parse(value: unknown): unknown }; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
 type Handler = (input: unknown, context?: unknown) => Promise<unknown> | unknown;
@@ -24,7 +29,8 @@ function start() {
         handlers.set(contract.name, handler);
         inputs.set(contract.name, contract.input);
       },
-      registerSettings: (definition: { schema: { parse(value: unknown): unknown } }) => ({ read: async () => ({ status: "ready", values: definition.schema.parse({}) }), subscribe: () => () => undefined }),
+      // Exports go to this test's own folder, never the person's Downloads.
+      registerSettings: (definition: { schema: { parse(value: unknown): unknown } }) => ({ read: async () => ({ status: "ready", values: definition.schema.parse({ exportFolder: join(folder, "exports") }) }), subscribe: () => () => undefined }),
       addHook: (_name: string, handler: typeof hook) => {
         hook = handler;
         return () => undefined;
@@ -224,11 +230,274 @@ describe("query tools", () => {
     expect(edited).toContain('"environment": "production"');
     const second = start();
     writeFileSync(join(second.folder, "connections.json"), edited);
-    const calls: [string, Record<string, unknown>][] = [["datawise_describe", {}], ["datawise_read", { table: "t" }], ["datawise_query", { query: "select 1" }], ["datawise_count", { table: "t" }], ["datawise_explain", { query: "select 1" }], ["datawise_history", {}], ["datawise_propose_query", { query: "delete from t" }], ["datawise_propose_write", { table: "t", delete: [{ id: 1 }] }]];
+    const calls: [string, Record<string, unknown>][] = [["datawise_describe", {}], ["datawise_read", { table: "t" }], ["datawise_query", { query: "select 1" }], ["datawise_count", { table: "t" }], ["datawise_explain", { query: "select 1" }], ["datawise_history", {}], ["datawise_propose_query", { query: "delete from t" }], ["datawise_propose_write", { table: "t", delete: [{ id: 1 }] }], ["datawise_propose_disconnect", {}], ["datawise_propose_connection_change", { changes: { group: "x" } }], ["datawise_propose_reset_ssh_key", {}], ["datawise_test_connection", {}], ["datawise_read_row", { table: "t", key: { id: 1 } }], ["datawise_propose_destroy", { table: "t", action: "drop" }], ["datawise_propose_import", { table: "t", format: "csv", text: "id\n5", mapping: { id: "id" } }], ["datawise_propose_export", { table: "t", format: "csv", fileName: "x" }], ["datawise_export_text", { table: "t", format: "csv" }], ["datawise_save_query", { name: "x", text: "select 1" }], ["datawise_propose_delete_saved_query", { name: "x" }], ["datawise_clear_history", {}], ["datawise_query_tabs", { action: "list" }], ["datawise_table_view", { table: "t", action: "get" }]];
     for (const [tool, input] of calls) {
       const answer = await second.use(tool, { connection: "Dev", ...input });
       expect(answer.isError, `${tool}: ${answer.text}`).toBe(true);
       expect(answer.text, tool).toMatch(/No (shared )?connection named Dev/);
+    }
+  });
+
+  async function status(use: (name: string, input: unknown) => Promise<{ text?: string }>, requestId: string, until: RegExp) {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const text = String((await use("datawise_write_status", { requestId })).text);
+      if (until.test(text)) return text;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("the request never finished");
+  }
+  const requestIdOf = (answer: { text?: string }) => /Request (\S+) is waiting/.exec(String(answer.text))?.[1] as string;
+
+  it("runs an approved app action through the app's handler, and nothing before approval", async () => {
+    const { use, call } = await shared("none");
+    const requestId = requestIdOf(await use("datawise_propose_disconnect", { connection: "Dev" }));
+    expect(await status(use, requestId, /./)).toMatch(/Waiting for the person/);
+    const { events } = (await call("agent-activity.list", {})) as { events: { action: string }[] };
+    expect(events.map((event) => event.action)).toEqual(["proposed"]);
+    await call("agent-requests.decide", { id: requestId, approve: true });
+    expect(await status(use, requestId, /^(Done|It failed)/)).toBe("Done.");
+  });
+
+  it("refuses an approved disconnect while a job runs on the connection", async () => {
+    const { use, call } = await shared("none");
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id;
+    const slow = (await call("query.run", { scope: { connectionId }, text: "with recursive c(x) as (select 1 union all select x + 1 from c where x < 30000000) select count(*) from c" })) as { job: { id: string } };
+    const requestId = requestIdOf(await use("datawise_propose_disconnect", { connection: "Dev" }));
+    await call("agent-requests.decide", { id: requestId, approve: true });
+    expect(await status(use, requestId, /^(Done|It failed)/)).toMatch(/It failed/);
+    await call("jobs.cancel", { id: slow.job.id });
+  });
+
+  it("drops a waiting action when the person saves the connection", async () => {
+    const { use, call } = await shared("none");
+    const saved = ((await call("connections.list", {})) as { connections: Record<string, unknown>[] }).connections[0] as Record<string, unknown>;
+    const requestId = requestIdOf(await use("datawise_propose_disconnect", { connection: "Dev" }));
+    await call("connections.save", { ...saved, group: "moved" });
+    expect(await status(use, requestId, /./)).toMatch(/expired/);
+  });
+
+  it("proposes a connection with no secret and no guard, saved only by the person's form", async () => {
+    const { use, call } = await shared("none");
+    const answer = await use("datawise_propose_connection", { name: "Pg", engine: "postgres", host: "db.example", port: 5432, user: "app", password: "leak", environment: "development", agentAccess: "schema", agentRowAccess: "propose", safety: "open" });
+    const requestId = requestIdOf(answer);
+    const detail = (await call("agent-requests.get", { id: requestId })) as { connectionProposal: Record<string, unknown>; request: { kind: string } };
+    expect(detail.request.kind).toBe("connection");
+    expect(Object.keys(detail.connectionProposal).sort()).toEqual(["engine", "host", "name", "port", "user"]);
+    expect(((await call("connections.list", {})) as { connections: { name: string }[] }).connections.map((item) => item.name)).toEqual(["Dev"]);
+    await expect(call("agent-requests.decide", { id: requestId, approve: true })).rejects.toThrow(/saving the connection in the form/);
+    const saved = (await call("connections.save", { ...detail.connectionProposal, password: "typed by the person", agentRequestId: requestId })) as { name: string; environment: string; agentAccess: string };
+    expect(saved).toMatchObject({ name: "Pg", environment: "none", agentAccess: "none" });
+    expect(await status(use, requestId, /./)).toMatch(/The person saved the connection Pg/);
+    await expect(call("connections.save", { ...detail.connectionProposal, name: "Pg again", agentRequestId: requestId })).rejects.toThrow(/no longer waiting/);
+  });
+
+  it("refuses a proposed name that is taken", async () => {
+    const { use } = await shared("none");
+    expect((await use("datawise_propose_connection", { name: "Dev", engine: "sqlite", file: "/tmp/x.db" })).text).toMatch(/already named Dev/);
+  });
+
+  it("clears the saved password and the sharing when a change moves where the connection points", async () => {
+    const { use, call, folder } = await shared("none");
+    const pg = (await call("connections.save", { name: "Pg", engine: "postgres", host: "a.example", port: 5432, user: "app", password: "kept-secret", environment: "development", agentAccess: "schema", agentRowAccess: "read" })) as Record<string, unknown>;
+    const requestId = requestIdOf(await use("datawise_propose_connection_change", { connection: "Pg", changes: { host: "b.example" } }));
+    const detail = (await call("agent-requests.get", { id: requestId })) as { connectionProposal: Record<string, unknown> };
+    expect(detail.connectionProposal).toEqual({ host: "b.example" });
+    await call("connections.save", { ...pg, ...detail.connectionProposal, agentRequestId: requestId });
+    const stored = (JSON.parse(readFileSync(join(folder, "connections.json"), "utf8")) as { connections: Record<string, unknown>[] }).connections.find((item) => item.name === "Pg") as Record<string, unknown>;
+    expect(stored).toMatchObject({ host: "b.example", password: null, agentAccess: "none", agentRowAccess: "none" });
+    expect(JSON.stringify(stored)).not.toContain("kept-secret");
+  });
+
+  it("keeps the saved password when a change does not move the connection", async () => {
+    const { use, call, folder } = await shared("none");
+    const pg = (await call("connections.save", { name: "Pg", engine: "postgres", host: "a.example", port: 5432, user: "app", password: "kept-secret" })) as Record<string, unknown>;
+    const requestId = requestIdOf(await use("datawise_propose_connection_change", { connection: "Pg", changes: { group: "Team" } }));
+    await call("connections.save", { ...pg, group: "Team", agentRequestId: requestId });
+    const stored = (JSON.parse(readFileSync(join(folder, "connections.json"), "utf8")) as { connections: Record<string, unknown>[] }).connections.find((item) => item.name === "Pg") as Record<string, unknown>;
+    expect(stored).toMatchObject({ group: "Team", password: "kept-secret" });
+  });
+
+  it("tests a connection, and stops after a failure until the person tests it", async () => {
+    const { use, call } = await shared("none");
+    expect((await use("datawise_test_connection", { connection: "Dev" })).text).toBe("Connected.");
+    const pg = (await call("connections.save", { name: "Gone", engine: "postgres", host: "127.0.0.1", port: 1, user: "x", password: "y" })) as Record<string, unknown>;
+    expect((await use("datawise_test_connection", { connection: "Gone" })).text).toMatch(/Could not connect/);
+    expect((await use("datawise_test_connection", { connection: "Gone" })).text).toMatch(/last test of this connection failed/);
+    await call("connections.test", pg);
+    expect((await use("datawise_test_connection", { connection: "Gone" })).text).toMatch(/Wait 10 seconds|Could not connect/);
+    await call("connections.save", { name: "Session", engine: "postgres", host: "127.0.0.1", port: 1, user: "x", rememberPassword: false });
+    expect((await use("datawise_test_connection", { connection: "Session" })).text).toMatch(/session only/);
+  });
+
+  it("drops a table only after the person types its name", async () => {
+    const { use, call, folder } = await shared("propose");
+    const tableExists = () => {
+      const db = new DatabaseSync(join(folder, "dev.db"));
+      const found = db.prepare("select count(*) as n from sqlite_master where name = 't'").get() as { n: number };
+      db.close();
+      return found.n === 1;
+    };
+    const first = requestIdOf(await use("datawise_propose_destroy", { connection: "Dev", table: "t", action: "drop" }));
+    expect(((await call("agent-requests.get", { id: first })) as { typeToConfirm: string }).typeToConfirm).toBe("t");
+    await call("agent-requests.decide", { id: first, approve: true });
+    expect(await status(use, first, /^(Done|It failed)/)).toMatch(/It failed/);
+    const wrong = requestIdOf(await use("datawise_propose_destroy", { connection: "Dev", table: "t", action: "drop" }));
+    await call("agent-requests.decide", { id: wrong, approve: true, confirmName: "T" });
+    expect(await status(use, wrong, /^(Done|It failed)/)).toMatch(/It failed/);
+    expect(tableExists()).toBe(true);
+    const right = requestIdOf(await use("datawise_propose_destroy", { connection: "Dev", table: "t", action: "drop" }));
+    await call("agent-requests.decide", { id: right, approve: true, confirmName: "t" });
+    expect(await status(use, right, /^(Done|It failed)/)).toMatch(/^Done/);
+    expect(tableExists()).toBe(false);
+  });
+
+  it("imports rows given as text only after approval", async () => {
+    const { use, call, folder } = await shared("propose");
+    const count = () => {
+      const db = new DatabaseSync(join(folder, "dev.db"));
+      const found = db.prepare("select count(*) as n from t").get() as { n: number };
+      db.close();
+      return found.n;
+    };
+    const requestId = requestIdOf(await use("datawise_propose_import", { connection: "Dev", table: "t", format: "csv", text: "id,note\n2,b\n3,c\n", mapping: { id: "id", note: "note" } }));
+    expect(count()).toBe(1);
+    await call("agent-requests.decide", { id: requestId, approve: true });
+    expect(await status(use, requestId, /^(Done|It failed)/)).toMatch(/^Done/);
+    expect(count()).toBe(3);
+  });
+
+  it("exports to a new file in the export folder only after approval, and refuses any other path", async () => {
+    const { use, call, folder } = await shared("read");
+    for (const fileName of ["../x", "/tmp/x", ".zshenv", "a/b"]) expect((await use("datawise_propose_export", { connection: "Dev", table: "t", format: "csv", fileName })).text).toMatch(/file name only/);
+    const requestId = requestIdOf(await use("datawise_propose_export", { connection: "Dev", table: "t", format: "csv", fileName: "notes" }));
+    const exports = join(folder, "exports");
+    expect(existsSync(exports) ? readdirSync(exports) : []).toEqual([]);
+    await call("agent-requests.decide", { id: requestId, approve: true });
+    expect(await status(use, requestId, /^(Done|It failed)/)).toMatch(/^Done/);
+    const files = readdirSync(exports);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^notes-.*\.csv$/);
+    expect(readFileSync(join(exports, files[0] as string), "utf8")).toContain("note");
+  });
+
+  it("exports as text at once, and reads one row and the structure lists", async () => {
+    const { use } = await shared("read");
+    expect((await use("datawise_export_text", { connection: "Dev", table: "t", format: "csv" })).text).toMatch(/id,note\s+1,a/);
+    expect((await use("datawise_read_row", { connection: "Dev", table: "t", key: { id: 1 } })).text).toContain('"row":[1,"a"]');
+    expect((await use("datawise_read_row", { connection: "Dev", table: "t", key: { id: 9 } })).text).toBe("No row has that key.");
+    expect((await use("datawise_describe", { connection: "Dev", list: "databases" })).text).toMatch(/no databases to list/);
+  });
+
+  it("saves a query under a new name only, and logs it", async () => {
+    const { use, call } = await shared("none");
+    expect((await use("datawise_save_query", { connection: "Dev", name: "Monthly", text: "select 1" })).text).toBe("Saved Monthly.");
+    expect((await use("datawise_save_query", { connection: "Dev", name: "Monthly", text: "delete from t" })).text).toMatch(/already named Monthly/);
+    const { events } = (await call("agent-activity.list", {})) as { events: { action: string; change?: string }[] };
+    expect(events[0]).toMatchObject({ action: "done", change: "saved query Monthly" });
+  });
+
+  it("deletes a saved query only after approval, and not if its text changed", async () => {
+    const { use, call } = await shared("none");
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id as string;
+    const saved = (await call("saved.save", { connectionId, name: "Monthly", text: "select 1" })) as { id: string };
+    const changed = requestIdOf(await use("datawise_propose_delete_saved_query", { connection: "Dev", name: "Monthly" }));
+    await call("saved.save", { connectionId, id: saved.id, name: "Monthly", text: "select 2" });
+    await call("agent-requests.decide", { id: changed, approve: true });
+    expect(await status(use, changed, /^(Done|It failed)/)).toMatch(/It failed/);
+    const requestId = requestIdOf(await use("datawise_propose_delete_saved_query", { connection: "Dev", name: "Monthly" }));
+    expect(((await call("saved.list", { connectionId })) as { queries: unknown[] }).queries).toHaveLength(1);
+    await call("agent-requests.decide", { id: requestId, approve: true });
+    expect(await status(use, requestId, /^(Done|It failed)/)).toBe("Done.");
+    expect(((await call("saved.list", { connectionId })) as { queries: unknown[] }).queries).toHaveLength(0);
+  });
+
+  it("clears history at once and logs it", async () => {
+    const { use, run, call } = await shared("none");
+    await run("select 1");
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id as string;
+    expect((await use("datawise_clear_history", { connection: "Dev" })).text).toMatch(/Cleared/);
+    expect(((await call("history.list", { connectionId })) as { entries: unknown[] }).entries).toHaveLength(0);
+  });
+
+  it("lists tab names without text, renames, and closes only tabs whose text is saved or empty", async () => {
+    const { use, call, window, pushed } = await shared("none");
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id as string;
+    await call("workspace.tabs.save", { connectionId, tabs: { activeId: "a", tabs: [{ id: "a", name: "One", text: "CREATE USER u PASSWORD 'canary'" }, { id: "b", name: "Two", text: "" }] } });
+    window();
+    const listed = String((await use("datawise_query_tabs", { connection: "Dev", action: "list" })).text);
+    expect(listed).not.toContain("canary");
+    expect(JSON.parse(listed)).toEqual([{ id: "a", name: "One" }, { id: "b", name: "Two" }]);
+    expect((await use("datawise_query_tabs", { connection: "Dev", action: "close", tabId: "a" })).text).toMatch(/saved nowhere else/);
+    await use("datawise_query_tabs", { connection: "Dev", action: "rename", tabId: "a", name: "Renamed" });
+    await use("datawise_query_tabs", { connection: "Dev", action: "close", tabId: "b" });
+    expect(pushed).toEqual([{ kind: "tabs", connectionId, renamed: [{ id: "a", name: "Renamed" }], closed: [] }, { kind: "tabs", connectionId, renamed: [], closed: [{ id: "b", text: "" }] }]);
+    const stored = ((await call("workspace.tabs.get", { connectionId })) as { tabs: { tabs: { name: string }[] } }).tabs.tabs;
+    expect(stored.map((tab) => tab.name)).toEqual(["Renamed"]);
+    expect((await use("datawise_query_tabs", { connection: "Dev", action: "close", tabId: "a" })).text).toMatch(/last tab/);
+  });
+
+  it("reads and changes how a table is shown, never returning filters", async () => {
+    const { use, call, window, pushed } = await shared("none");
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id as string;
+    await call("views.save", { ref: { connectionId, name: "t" }, view: { filtersInUse: [{ column: "note", op: "eq", value: "secret-filter" }] } });
+    window();
+    expect((await use("datawise_table_view", { connection: "Dev", table: "t", action: "get" })).text).not.toContain("secret-filter");
+    await use("datawise_table_view", { connection: "Dev", table: "t", action: "set", hiddenColumns: ["note"] });
+    expect(pushed[0]).toMatchObject({ kind: "view", hiddenColumns: ["note"] });
+    const view = (await call("views.get", { connectionId, name: "t" })) as { hiddenColumns: string[]; filtersInUse: unknown[] };
+    expect(view).toMatchObject({ hiddenColumns: ["note"], filtersInUse: [{ value: "secret-filter" }] });
+  });
+
+  it("counts at-once changes toward the per-agent limit, and stops agent saves at 200 per connection", async () => {
+    const { use, call } = await shared("none");
+    for (let index = 0; index < 60; index += 1) expect((await use("datawise_clear_history", { connection: "Dev" })).isError).toBeFalsy();
+    expect((await use("datawise_save_query", { connection: "Dev", name: "late", text: "select 1" })).text).toMatch(/in the last minute/);
+    const connectionId = ((await call("connections.list", {})) as { connections: { id: string }[] }).connections[0]?.id as string;
+    for (let index = 0; index < 200; index += 1) await call("saved.save", { connectionId, name: `q${index}`, text: "select 1" });
+    expect((await use("datawise_save_query", { connection: "Dev", name: "one more", text: "select 1" }, { id: "agent-b", title: null, workspaceId: null })).text).toMatch(/already has 200 saved queries/);
+  });
+
+  it("counts new-connection proposals per agent, not in one shared queue", async () => {
+    const { use } = await shared("none");
+    for (let agent = 0; agent < 5; agent += 1) {
+      for (let index = 0; index < 4; index += 1) expect((await use("datawise_propose_connection", { name: `c${agent}-${index}`, engine: "sqlite", file: "/tmp/x.db" }, { id: `agent-${agent}`, title: null, workspaceId: null })).text).toMatch(/is waiting/);
+    }
+    expect((await use("datawise_propose_connection", { name: "one more", engine: "sqlite", file: "/tmp/x.db" }, { id: "agent-9", title: null, workspaceId: null })).text).toMatch(/is waiting/);
+  });
+
+  it("never sends the saved password when the person tests an agent's change that moves the connection", async () => {
+    const { use, call } = await shared("none");
+    // A minimal PostgreSQL server: it asks for a plain-text password and records everything the client sends.
+    const listen = async () => {
+      const received: Buffer[] = [];
+      const server: Server = createServer((socket) => {
+        let asked = false;
+        socket.on("data", (chunk) => {
+          received.push(chunk);
+          if (!asked) {
+            asked = true;
+            socket.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 3]));
+          } else socket.destroy();
+        });
+        socket.on("error", () => undefined);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      return { server, received, port: (server.address() as { port: number }).port };
+    };
+    const first = await listen();
+    const second = await listen();
+    try {
+      const pg = (await call("connections.save", { name: "Pg", engine: "postgres", host: "127.0.0.1", port: first.port, user: "app", database: "app", password: "kept-secret" })) as Record<string, unknown>;
+      // The control: the person's own test of the saved connection does send the saved password.
+      await call("connections.test", pg);
+      expect(Buffer.concat(first.received).toString("latin1")).toContain("kept-secret");
+      const requestId = requestIdOf(await use("datawise_propose_connection_change", { connection: "Pg", changes: { port: second.port } }));
+      await call("connections.test", { ...pg, port: second.port, agentRequestId: requestId });
+      expect(Buffer.concat(second.received).length).toBeGreaterThan(0);
+      expect(Buffer.concat(second.received).toString("latin1")).not.toContain("kept-secret");
+    } finally {
+      first.server.close();
+      second.server.close();
     }
   });
 

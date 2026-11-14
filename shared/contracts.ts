@@ -72,6 +72,8 @@ export const connectionInput = z.object({
   sshPassword: secretChange,
   sshPrivateKey: secretChange,
   sshPassphrase: secretChange,
+  // Set when the person saves a connection an agent proposed, so the save completes that request in the same step.
+  agentRequestId: z.string().optional(),
 });
 export type ConnectionInput = z.input<typeof connectionInput>;
 
@@ -254,6 +256,30 @@ export const agentOpenEvent = z.object({
 });
 export type AgentOpenEvent = z.infer<typeof agentOpenEvent>;
 
+// An agent renamed or closed query tabs. A window closes a tab only while its text is still the text the server saw,
+// so anything the person typed since keeps the tab.
+export const agentTabsEvent = z.object({
+  kind: z.literal("tabs"),
+  connectionId: z.string(),
+  renamed: z.array(z.object({ id: z.string(), name: z.string().max(60) })),
+  closed: z.array(z.object({ id: z.string(), text: z.string() })),
+});
+export type AgentTabsEvent = z.infer<typeof agentTabsEvent>;
+
+// An agent changed how a table is shown. Only the fields it changed are sent; a window merges them into its own.
+export const agentViewEvent = z.object({
+  kind: z.literal("view"),
+  ref: objectRef,
+  hiddenColumns: z.array(z.string()).optional(),
+  columnOrder: z.array(z.string()).optional(),
+  sort: sort.nullable().optional(),
+});
+export type AgentViewEvent = z.infer<typeof agentViewEvent>;
+
+// What reaches every open window. An open request is the one without a kind, as it was before the others existed.
+export const agentEvent = z.union([agentTabsEvent, agentViewEvent, agentOpenEvent]);
+export type AgentEvent = z.infer<typeof agentEvent>;
+
 export const queryTabRecord = z.object({ id: z.string(), name: z.string().max(60), text: z.string().max(1024 * 1024) });
 export type QueryTabRecord = z.infer<typeof queryTabRecord>;
 export const queryTabs = z.object({ activeId: z.string(), tabs: z.array(queryTabRecord).max(30) });
@@ -264,8 +290,33 @@ export const agentRequestItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("update"), key: rowKey, changes: z.array(z.object({ column: z.string(), before: z.unknown(), after: z.unknown() })) }),
   z.object({ kind: z.literal("delete"), key: rowKey, row: z.record(z.string(), z.unknown()) }),
   z.object({ kind: z.literal("statement"), text: z.string() }),
+  // One line of an action or connection proposal, shown as a label and a value.
+  z.object({ kind: z.literal("field"), label: z.string(), value: z.string() }),
 ]);
 export type AgentRequestItem = z.infer<typeof agentRequestItem>;
+
+// What an agent may propose for a connection: never a secret, and never a guard (label, sharing, write mode).
+export const connectionProposal = z.object({
+  name: z.string().trim().min(1).max(120),
+  engine: engineId,
+  host: z.string().trim().max(255),
+  port: z.number().int().min(1).max(65535).nullable(),
+  user: z.string().max(255),
+  database: z.string().max(255),
+  file: z.string().max(4096),
+  serviceName: z.string().max(255),
+  localDataCenter: z.string().max(255),
+  region: z.string().max(64),
+  endpoint: z.string().max(2048),
+  accessKeyId: z.string().max(255),
+  authSource: z.string().max(255),
+  tls: tlsMode,
+  caCertificate: z.string().max(64 * 1024),
+  group: z.string().trim().max(60),
+  color: connectionColor.nullable(),
+  ssh: sshInput.nullable(),
+}).partial();
+export type ConnectionProposal = z.infer<typeof connectionProposal>;
 
 export const agentRequestSummary = z.object({
   id: z.string(),
@@ -278,6 +329,10 @@ export const agentRequestSummary = z.object({
   rows: z.number(),
   // What rows counts: rows changed by a row proposal, or statements in a query proposal.
   unit: z.enum(["rows", "statements"]),
+  // change: rows or statements; action: one app action run after approval; connection: approved by saving the form.
+  kind: z.enum(["change", "action", "connection"]),
+  // What an action or connection request would do, in a few words, such as "add the connection Team PG".
+  headline: z.string().nullable(),
   // partial: some statements of a query proposal ran before one failed, and those stay applied.
   status: z.enum(["pending", "running", "done", "failed", "partial", "unknown", "rejected", "expired"]),
   message: z.string().nullable(),
@@ -298,6 +353,8 @@ export const agentActivityEvent = z.object({
   rows: z.number(),
   // Absent in logs written before statement proposals, which counted only rows.
   unit: z.enum(["rows", "statements"]).default("rows"),
+  // What an agent changed at once, without approval, such as "cleared history". Absent in older logs.
+  change: z.string().optional(),
 });
 export type AgentActivityEvent = z.infer<typeof agentActivityEvent>;
 
@@ -381,7 +438,7 @@ const byId = z.object({ id: z.string() });
 const ok = z.object({ ok: z.literal(true) });
 
 export const subscriptions = {
-  agentOpens: defineSubscription({ name: "agent.opens", input: z.object({}), event: agentOpenEvent }),
+  agentOpens: defineSubscription({ name: "agent.opens", input: z.object({}), event: agentEvent }),
 };
 
 export const rpc = {
@@ -472,8 +529,8 @@ export const rpc = {
     output: jobView,
   }),
   listAgentRequests: defineRpc({ name: "agent-requests.list", input: z.object({}), output: z.object({ requests: z.array(agentRequestSummary) }) }),
-  getAgentRequest: defineRpc({ name: "agent-requests.get", input: z.object({ id: z.string() }), output: z.object({ request: agentRequestSummary, items: z.array(agentRequestItem) }) }),
-  decideAgentRequest: defineRpc({ name: "agent-requests.decide", input: z.object({ id: z.string(), approve: z.boolean() }), output: agentRequestSummary }),
+  getAgentRequest: defineRpc({ name: "agent-requests.get", input: z.object({ id: z.string() }), output: z.object({ request: agentRequestSummary, items: z.array(agentRequestItem), connectionProposal: connectionProposal.nullable(), typeToConfirm: z.string().nullable() }) }),
+  decideAgentRequest: defineRpc({ name: "agent-requests.decide", input: z.object({ id: z.string(), approve: z.boolean(), confirmName: z.string().optional() }), output: agentRequestSummary }),
   listAgentActivity: defineRpc({ name: "agent-activity.list", input: z.object({}), output: z.object({ events: z.array(agentActivityEvent) }) }),
   clearAgentActivity: defineRpc({ name: "agent-activity.clear", input: z.object({}), output: ok }),
   getView: defineRpc({ name: "views.get", input: objectRef, output: savedView }),

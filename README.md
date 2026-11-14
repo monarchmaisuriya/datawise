@@ -4,7 +4,7 @@
 
 A database client for [Paseo](https://paseo.sh): browse, query, edit, import and export data from PostgreSQL, MySQL, SQLite, SQL Server, Oracle, ClickHouse, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j. See [OVERVIEW.md](OVERVIEW.md) for what it does and its limits.
 
-Current release: **v0.6.1**. Datawise follows [Semantic Versioning](https://semver.org/); while it is below 1.0.0, a minor release may include breaking changes. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.7.0**. Datawise follows [Semantic Versioning](https://semver.org/); while it is below 1.0.0, a minor release may include breaking changes. See [CHANGELOG.md](CHANGELOG.md).
 
 Requires Paseo 0.16.0-beta.2 or later, and `npm` on the daemon machine's `PATH`.
 
@@ -15,7 +15,7 @@ Requires Paseo 0.16.0-beta.2 or later, and `npm` on the daemon machine's `PATH`.
 ## Install
 
 ```bash
-paseo plugin install git:https://github.com/monarchmaisuriya/datawise.git --ref v0.6.1
+paseo plugin install git:https://github.com/monarchmaisuriya/datawise.git --ref v0.7.0
 ```
 
 To move to a later release, pick a tag from the [releases page](https://github.com/monarchmaisuriya/datawise/releases) and put it in place of `<tag>`:
@@ -49,6 +49,23 @@ Paseo agents get these tools while Paseo's "Enable Paseo tools" host setting is 
 | `datawise_propose_write` | Proposals | Proposes row inserts, updates and deletes for your approval |
 | `datawise_propose_query` | Proposals | Proposes statements for your approval |
 | `datawise_write_status` | Nothing shared | Says what became of a proposal |
+| `datawise_read_row` | Rows | Reads one row by its key |
+| `datawise_export_text` | Rows | Returns a table or read statements as text |
+| `datawise_propose_destroy` | Proposals | Proposes deleting a table or all its rows; you type its name to approve |
+| `datawise_propose_import` | Proposals | Proposes importing rows given as text |
+| `datawise_propose_export` | Rows | Proposes exporting to a new file in your export folder |
+| `datawise_propose_connection` | Nothing shared | Proposes a new connection without secrets; you review, type the secret and save |
+| `datawise_propose_connection_change` | Any but production | Proposes new settings for a connection; you review and save |
+| `datawise_propose_disconnect` | Any but production | Proposes closing a connection's session |
+| `datawise_propose_reset_ssh_key` | Any but production | Proposes forgetting a pinned SSH host key |
+| `datawise_test_connection` | Any but production | Says whether a connection connects |
+| `datawise_save_query` | Names | Saves query text under a new name |
+| `datawise_propose_delete_saved_query` | Names | Proposes deleting a saved query |
+| `datawise_clear_history` | Names | Clears query history |
+| `datawise_query_tabs` | Names | Lists, renames or closes query tabs |
+| `datawise_table_view` | Names | Reads or sets hidden columns, order and sort |
+
+Deleting a connection, unlocking one with its password, and approving requests stay yours; [OVERVIEW.md](OVERVIEW.md) lists everything agents never get, and why.
 
 ## Develop
 

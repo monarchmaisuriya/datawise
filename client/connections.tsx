@@ -3,9 +3,10 @@ import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { parseConnectionUrl } from "../shared/connection-url";
 import { rowAccessPossible } from "../shared/agent-access";
-import type { AgentAccess, AgentRowAccess, ConnectionColor, ConnectionInput, ConnectionView, EnvironmentLabel, SafetyMode, TlsMode } from "../shared/contracts";
+import type { AgentAccess, AgentRowAccess, ConnectionColor, ConnectionInput, ConnectionProposal, ConnectionView, EnvironmentLabel, SafetyMode, TlsMode } from "../shared/contracts";
 import { ENGINE_IDS, ENGINES, type EngineId, FIELD_LABELS } from "../shared/engines";
 import { Btn, Chip, connectionColorValue, errorText, Field, Message, Modal, Pill, PinnedFooter, Section, Segmented, Select, useApi, useConfirm, useUi } from "./kit";
+import { movesSecrets } from "./proposal-note";
 import { usePreferences } from "./preferences";
 
 const SAFETY_TEXT: Record<SafetyMode, string> = {
@@ -149,13 +150,26 @@ function toDraft(connection: ConnectionView): Draft {
   return { environment: connection.environment, color: connection.color, group: connection.group, agentAccess: connection.agentAccess, agentRowAccess: connection.agentRowAccess, name: connection.name, engine: connection.engine, host: connection.host, port: connection.port === null ? "" : String(connection.port), user: connection.user, database: connection.database, file: connection.file, serviceName: connection.serviceName, localDataCenter: connection.localDataCenter, region: connection.region, endpoint: connection.endpoint, accessKeyId: connection.accessKeyId, authSource: connection.authSource, caCertificate: connection.caCertificate, rememberPassword: connection.rememberPassword, tls: connection.tls, safety: connection.safety, useSsh: connection.ssh !== null, sshHost: connection.ssh?.host ?? "", sshPort: String(connection.ssh?.port ?? 22), sshUser: connection.ssh?.user ?? "" };
 }
 
-export function ConnectionForm({ connection, prefill, note, onClose, onSaved, onDeleted }: { connection: ConnectionView | null; prefill?: ConnectionPrefill; note?: string; onClose: () => void; onSaved: (saved: ConnectionView) => void; onDeleted: (id: string) => void }) {
+// The form's fields for the settings an agent proposed. Only the allowed keys exist on a proposal.
+export function proposalDraft(values: ConnectionProposal): Partial<Draft> {
+  const { port, ssh, ...rest } = values;
+  return {
+    ...rest,
+    ...(port === undefined ? {} : { port: port === null ? "" : String(port) }),
+    ...(ssh === undefined ? {} : ssh === null ? { useSsh: false } : { useSsh: true, sshHost: ssh.host, sshPort: String(ssh.port), sshUser: ssh.user }),
+  };
+}
+
+export function ConnectionForm({ connection, prefill, proposal, note, onClose, onSaved, onDeleted }: { connection: ConnectionView | null; prefill?: ConnectionPrefill; proposal?: { requestId: string; values: ConnectionProposal }; note?: string; onClose: () => void; onSaved: (saved: ConnectionView) => void; onDeleted: (id: string) => void }) {
   const ui = useUi();
   const api = useApi();
   const ask = useConfirm();
   const preferences = usePreferences();
   // The preference applies only here. A stored connection never takes its write mode from a preference.
-  const [draft, setDraft] = useState<Draft>(() => (connection ? toDraft(connection) : { ...emptyDraft(preferences.newConnectionSafety), ...prefill }));
+  const [draft, setDraft] = useState<Draft>(() => {
+    const start = connection ? toDraft(connection) : { ...emptyDraft(preferences.newConnectionSafety), ...prefill };
+    return proposal ? { ...start, ...proposalDraft(proposal.values) } : start;
+  });
   const [url, setUrl] = useState("");
   const [urlOpen, setUrlOpen] = useState(false);
   const [tlsTouched, setTlsTouched] = useState(connection !== null);
@@ -216,6 +230,8 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
     sshPassword,
     sshPrivateKey: sshKey,
     sshPassphrase,
+    // The server completes the agent's request with this save, and applies its rules to it.
+    agentRequestId: proposal?.requestId,
   });
 
   const run = async (work: () => Promise<void>) => {
@@ -245,7 +261,9 @@ export function ConnectionForm({ connection, prefill, note, onClose, onSaved, on
       await api.deleteConnection({ id: connection.id });
       onDeleted(connection.id);
     });
-  const secretHint = (saved: boolean | undefined) => (saved ? "Saved. Leave blank to keep it." : undefined);
+  // An agent's change that moves the connection drops its saved secrets on save, so the form must not say otherwise.
+  const secretsMove = proposal ? movesSecrets(proposal.values, connection) : false;
+  const secretHint = (saved: boolean | undefined) => (saved ? (secretsMove ? "The agent's change moves this connection, so the saved one is not kept. Type it again." : "Saved. Leave blank to keep it.") : undefined);
 
   const remote = has("host") && !isLoopback(draft.host.trim());
   // The same rule the server uses for its "not encrypted" warning.

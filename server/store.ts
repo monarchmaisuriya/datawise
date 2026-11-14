@@ -50,7 +50,7 @@ const storeFile = z.object({
 type StoreFile = z.infer<typeof storeFile>;
 
 const HISTORY_LIMIT = 200;
-const SECRET_FIELDS = ["password", "apiKey", "sshPassword", "sshPrivateKey", "sshPassphrase"] as const;
+export const SECRET_FIELDS = ["password", "apiKey", "sshPassword", "sshPrivateKey", "sshPassphrase"] as const;
 
 function isLoopback(host: string): boolean {
   return host === "" || host === "localhost" || host === "::1" || host.startsWith("127.");

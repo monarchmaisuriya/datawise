@@ -1,6 +1,7 @@
 import { copyText, FlatList, Icon, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import { applyAgentTabs, onAgentTabs } from "./agent-push";
 import { Pressable, Text, View } from "react-native";
 import type { ConnectionView, JobView, QueryResult, QueryTabRecord, QueryTabs, Scope } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
@@ -80,6 +81,11 @@ export function QueryWorkspace({ connection, scope, prefill, onPrefillUsed }: { 
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
+
+  // An agent's rename or close, applied to this window's own tabs; the next save then carries it.
+  useEffect(() => onAgentTabs((event) => {
+    if (event.connectionId === connection.id) setState((current) => (current ? applyAgentTabs(current, event) : current));
+  }), [connection.id]);
 
   useEffect(() => {
     if (!state || JSON.stringify(state) === lastSaved.current) return;

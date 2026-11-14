@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentRequestItem, AgentRequestSummary, EnvironmentLabel, ObjectRef, StagedEdit } from "../shared/contracts";
+import type { AgentRequestItem, AgentRequestSummary, ConnectionProposal, EnvironmentLabel, ObjectRef, StagedEdit } from "../shared/contracts";
 import type { ParsedStatement } from "./adapters/types";
 
 const TTL_MS = 30 * 60 * 1000;
@@ -22,6 +22,10 @@ export interface AgentRequest extends AgentRequestSummary {
   mayBePartial: boolean;
   // How many proposed statements ran before one failed. The agent gets this count, never the database's error.
   ran: number | null;
+  // An app action run after approval through the same handler the app calls, with its input already parsed.
+  action: { name: string; input: unknown; expectedText?: string } | null;
+  // A connection an agent proposed. It is approved by the person saving the connection form, never by Approve.
+  connectionProposal: ConnectionProposal | null;
 }
 
 export interface NewRequest {
@@ -38,10 +42,13 @@ export interface NewRequest {
   edits: StagedEdit[] | null;
   statements: ParsedStatement[] | null;
   mayBePartial: boolean;
+  action?: { name: string; input: unknown; expectedText?: string } | null;
+  connectionProposal?: ConnectionProposal | null;
+  headline?: string | null;
 }
 
 function summary(request: AgentRequest): AgentRequestSummary {
-  const { ref: _ref, target: _target, items: _items, inserts: _inserts, edits: _edits, statements: _statements, mayBePartial: _mayBePartial, ran: _ran, ...rest } = request;
+  const { ref: _ref, target: _target, items: _items, inserts: _inserts, edits: _edits, statements: _statements, mayBePartial: _mayBePartial, ran: _ran, action: _action, connectionProposal: _proposal, ...rest } = request;
   return rest;
 }
 
@@ -69,7 +76,8 @@ export class AgentRequests {
   limitReached(connectionId: string, agentId: string): string | null {
     this.sweep();
     const pending = [...this.requests.values()].filter((request) => request.status === "pending");
-    if (pending.filter((request) => request.connectionId === connectionId).length >= MAX_PER_CONNECTION) return `This connection already has ${MAX_PER_CONNECTION} requests waiting. Wait for the person to answer them.`;
+    // A new connection has no id yet, so its proposals count only against the agent that made them.
+    if (connectionId !== "" && pending.filter((request) => request.connectionId === connectionId).length >= MAX_PER_CONNECTION) return `This connection already has ${MAX_PER_CONNECTION} requests waiting. Wait for the person to answer them.`;
     if (pending.filter((request) => request.agentId === agentId).length >= MAX_PER_AGENT) return `You already have ${MAX_PER_AGENT} requests waiting. Wait for the person to answer them.`;
     return null;
   }
@@ -78,7 +86,10 @@ export class AgentRequests {
     const refusal = this.limitReached(fields.connectionId, fields.agentId);
     if (refusal) throw new Error(refusal);
     const now = Date.now();
-    const request: AgentRequest = { ...fields, id: randomUUID(), rows: fields.items.length, unit: fields.statements ? "statements" : "rows", status: "pending", message: null, affected: null, ran: null, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + TTL_MS).toISOString() };
+    const action = fields.action ?? null;
+    const connectionProposal = fields.connectionProposal ?? null;
+    const kind = connectionProposal ? "connection" : action ? "action" : "change";
+    const request: AgentRequest = { ...fields, action, connectionProposal, kind, headline: fields.headline ?? null, id: randomUUID(), rows: fields.items.length, unit: fields.statements ? "statements" : "rows", status: "pending", message: null, affected: null, ran: null, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + TTL_MS).toISOString() };
     this.requests.set(request.id, request);
     return request;
   }
@@ -117,8 +128,33 @@ export class AgentRequests {
     return request;
   }
 
-  expireConnection(connectionId: string, message: string) {
-    for (const request of this.requests.values()) if (request.connectionId === connectionId && request.status === "pending") this.expire(request, message);
+  // keep is the request whose own approval caused this, which finishes as done instead.
+  expireConnection(connectionId: string, message: string, keep: string | null = null) {
+    for (const request of this.requests.values()) if (request.connectionId === connectionId && request.status === "pending" && request.id !== keep) this.expire(request, message);
+  }
+
+  // Held while the person's save runs, so a second press cannot save the proposal twice.
+  claimConnection(id: string): AgentRequest {
+    const request = this.get(id);
+    if (request.kind !== "connection") throw new Error("This request is not a connection the agent proposed.");
+    if (request.status !== "pending") throw new Error(`This request is already ${request.status}, so the form was not saved for it.`);
+    request.status = "running";
+    return request;
+  }
+
+  releaseConnection(id: string): void {
+    const request = this.requests.get(id);
+    if (request?.status === "running") request.status = "pending";
+  }
+
+  // A connection request ends when the person's save of the form succeeds, in the same step as that save.
+  completeConnection(id: string, connectionId: string, connectionName: string): AgentRequest {
+    const request = this.get(id);
+    if (request.status !== "running") throw new Error(`This request is already ${request.status}.`);
+    request.status = "done";
+    request.connectionId = connectionId;
+    request.connectionName = connectionName;
+    return request;
   }
 
   summaryOf(request: AgentRequest): AgentRequestSummary {

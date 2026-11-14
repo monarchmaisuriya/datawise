@@ -5,11 +5,12 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { inferValue } from "../shared/values";
 import { open as openFile } from "node:fs/promises";
-import { agentActivityEvent, type AgentActivityEvent, type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult, type AgentOpenEvent, subscriptions } from "../shared/contracts";
+import { agentActivityEvent, type AgentActivityEvent, type ConnectionInput, type ExportFormat, type ExportSource, type JobView, type ObjectRef, type QueryResult, queryTabs, rpc, type SavedView, savedPlace, savedView, type Scope, searchStructure, type StartResult, type AgentEvent, type AgentOpenEvent, subscriptions } from "../shared/contracts";
 import { ENGINES } from "../shared/engines";
 import type { Adapter, StreamSource, WritePlan } from "./adapters/types";
 import { agentRowLevel } from "../shared/agent-access";
-import { AgentRequests } from "./agent-requests";
+import { type AgentRequest, AgentRequests } from "./agent-requests";
+import { HandlerRegistry, recordingHandlers } from "./agent-actions";
 import { type ActivityLog, agentTarget, createAgentTools, type OpenInTab, PROPOSED_RUN_MS } from "./agent-tool";
 import { CommitUnknown, PartialRunError } from "./adapters/sql-base";
 import { CELL_LIMIT } from "./cells";
@@ -22,7 +23,8 @@ import { PreferencesReader, preferencesDocument } from "./preferences";
 import { SideFile } from "./side-file";
 import { structureOf, structureText } from "./structure";
 import { checkDestroyName, gate } from "./safety";
-import { Store, toView } from "./store";
+import { secretDestination } from "../shared/connection-destination";
+import { SECRET_FIELDS, Store, type StoredConnection, toView } from "./store";
 import { z } from "zod";
 
 // Under the daemon's 30 second limit on any RPC, so the user sees this message rather than a timeout.
@@ -82,7 +84,9 @@ function viewKey(ref: ObjectRef): string {
   return JSON.stringify([ref.connectionId, ref.database ?? null, ref.schema ?? null, ref.name]);
 }
 
-export function contributeServer(server: Pick<PluginServerContext, "handle" | "registerSettings" | "addHook">, folder?: string) {
+export function contributeServer(host: Pick<PluginServerContext, "handle" | "registerSettings" | "addHook">, folder?: string) {
+  const handlers = new HandlerRegistry();
+  const server = recordingHandlers(host, handlers);
   const findFolder = folder ? () => Promise.resolve(folder) : dataFolder;
   const store = new Store(findFolder);
   const pool = new Pool(store);
@@ -111,12 +115,17 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   const requests = new AgentRequests((request) => record({ agentId: request.agentId, agentTitle: request.agentTitle, connectionId: request.connectionId, connectionName: request.connectionName, action: "expired", place: request.place, rows: request.rows, unit: request.unit }));
   const logAgent: ActivityLog = ({ connection, ...event }) => record({ ...event, connectionId: connection.id, connectionName: connection.name });
   // Every open Paseo window subscribes, so an agent's open-tab request reaches each of them.
-  const openers = new Set<(event: AgentOpenEvent) => Promise<void>>();
+  const openers = new Set<(event: AgentEvent) => Promise<void>>();
   server.handle(subscriptions.agentOpens, (_input, context) => {
-    const push = (event: AgentOpenEvent) => context.push(event);
+    const push = (event: AgentEvent) => context.push(event);
     openers.add(push);
     context.signal.addEventListener("abort", () => openers.delete(push));
   });
+  // Tells every open Paseo window, and returns how many there were.
+  const pushToWindows = async (event: AgentEvent) => {
+    await Promise.all([...openers].map((push) => push(event).catch(onStray)));
+    return openers.size;
+  };
   const openInTab: OpenInTab = async (event) => {
     // An open window saves the place once it moves there, so a person who declines, or keeps pending edits, keeps
     // their own. With no window, it is saved here for next time; a production place never is, as no one agreed.
@@ -125,10 +134,11 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
         state.places[`panel:${event.workspaceId}`] = event.place;
       });
     }
-    await Promise.all([...openers].map((push) => push(event).catch(onStray)));
-    return openers.size;
+    return pushToWindows(event);
   };
-  const agentTools = createAgentTools(store, pool, requests, logAgent, openInTab);
+  // Connections an agent's test failed on; it may not test them again until the person tests or saves them.
+  const agentTestFailures = new Set<string>();
+  const agentTools = createAgentTools(store, pool, requests, logAgent, openInTab, { handlers, agentTestFailures, jobs, pushToWindows });
   // Declared once, with the same list for every session, so changing what is shared never makes sessions reopen.
   // Each tool checks the connection on every call. The handler does no work, because one that throws would stop
   // every agent on the daemon from opening a session.
@@ -157,12 +167,48 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   };
 
   server.handle(rpc.listConnections, guard(async () => ({ connections: (await store.listConnections()).map(toView) })));
+  // Checks a save or test that carries an agent's request, and applies its rules: the proposal must still wait, the
+  // name must be free, and a proposal that moves where the connection sends its password gets no saved secret and
+  // no sharing.
+  const forAgentRequest = async (input: ConnectionInput): Promise<{ fields: ConnectionInput; request: AgentRequest | null }> => {
+    const { agentRequestId, ...fields } = input;
+    if (!agentRequestId) return { fields, request: null };
+    const request = requests.get(agentRequestId);
+    if (request.kind !== "connection" || request.status !== "pending") throw new Error("This agent request is no longer waiting, so nothing was done for it.");
+    if ((request.connectionId || undefined) !== fields.id) throw new Error("This form is not the connection the agent proposed.");
+    if ((await store.listConnections()).some((item) => item.id !== fields.id && item.name === fields.name)) throw new Error(`Another connection is already named ${fields.name}.`);
+    if (request.connectionId) {
+      const existing = await store.getConnection(request.connectionId);
+      if (existing.environment === "production") throw new Error("This connection is now labelled production, so nothing was done for this agent request.");
+      if (agentTarget(existing) !== request.target) throw new Error("This connection changed after the agent proposed this, so nothing was done for it.");
+      if (secretDestination(existing) !== secretDestination(fields)) {
+        for (const field of SECRET_FIELDS) if (fields[field] === undefined) fields[field] = null;
+        fields.agentAccess = "none";
+        fields.agentRowAccess = "none";
+      }
+    }
+    return { fields, request };
+  };
   server.handle(
     rpc.saveConnection,
     guard(async (input: RpcInput<typeof rpc.saveConnection>) => {
-      const saved = await store.saveConnection(input);
+      const { fields, request } = await forAgentRequest(input);
+      if (request) requests.claimConnection(request.id);
+      let saved: StoredConnection;
+      try {
+        saved = await store.saveConnection(fields);
+      } catch (error) {
+        if (request) requests.releaseConnection(request.id);
+        throw error;
+      }
+      // Completed with the save it belongs to, before anything else can fail and leave it running.
+      if (request) {
+        requests.completeConnection(request.id, saved.id, saved.name);
+        record({ agentId: request.agentId, agentTitle: request.agentTitle, connectionId: saved.id, connectionName: saved.name, action: "done", place: saved.name, rows: 0, unit: "rows", ...(request.headline ? { change: request.headline } : {}) });
+      }
       // A save can point this at another server, so nothing approved later may land on it.
-      requests.expireConnection(saved.id, "The connection was changed.");
+      requests.expireConnection(saved.id, "The connection was changed.", request?.id ?? null);
+      agentTestFailures.delete(saved.id);
       // The next request connects with the new settings.
       await pool.disconnect(saved.id);
       return toView(saved);
@@ -191,8 +237,10 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
   server.handle(
     rpc.testConnection,
     guard(async (input: RpcInput<typeof rpc.testConnection>) => {
+      const { fields } = await forAgentRequest(input);
+      if (fields.id) agentTestFailures.delete(fields.id);
       try {
-        const connection = await store.resolveInput(input);
+        const connection = await store.resolveInput(fields);
         const result = await withDeadline(pool.test(connection));
         return { ok: true, serverVersion: result.serverVersion, latencyMs: result.latencyMs, error: null, sshHostFingerprint: result.fingerprint };
       } catch (error) {
@@ -236,25 +284,74 @@ export function contributeServer(server: Pick<PluginServerContext, "handle" | "r
     ),
   );
   server.handle(rpc.writeBatch, guard(async (input: RpcInput<typeof rpc.writeBatch>) => withStartDeadline((stillWanted) => startBatch(input.ref, input, stillWanted))));
+  // Runs an approved app action through the handler the app calls, after checking again everything that may have
+  // changed while it waited. Returns how many rows it changed, when the action reports that.
+  const runApprovedAction = async (request: AgentRequest, confirmName: string | undefined): Promise<number | null> => {
+    const action = request.action as { name: string; input: Record<string, unknown>; expectedText?: string };
+    const connection = (await store.listConnections()).find((item) => item.id === request.connectionId);
+    if (!connection || connection.environment === "production") throw new Error("This connection is gone, or is now labelled production, so this was not run.");
+    if (agentTarget(connection) !== request.target) throw new Error("This connection now points somewhere else, so this was not run.");
+    const input = { ...action.input };
+    if (action.name === "data.destroy" || action.name === "import.start") {
+      if (agentRowLevel(connection) !== "propose") throw new Error("This connection no longer takes proposed changes.");
+    }
+    if (action.name === "export.start" && agentRowLevel(connection) === "none") throw new Error("This connection no longer shares rows with agents.");
+    // The person's own typing, passed as it is. The handler refuses a missing or wrong name.
+    if (action.name === "data.destroy") input.confirmName = confirmName ?? "";
+    if (action.name === "import.start") input.confirmed = true;
+    if (action.name === "saved.delete") {
+      const saved = (await store.listSaved(connection.id)).find((item) => item.id === input.id);
+      if (!saved || saved.text !== action.expectedText) throw new Error("This saved query changed or is gone, so it was not deleted.");
+    }
+    // Checked last, right before the call, and outside pool.use(), which itself counts as busy.
+    if (action.name === "connections.disconnect" && pool.isBusy(connection.id)) throw new Error("This connection is running a job, so it was not disconnected.");
+    const result = (await handlers.call(action.name, input)) as { status?: string; job?: JobView } | undefined;
+    if (result?.status === "confirm") throw new Error("Datawise asked for a confirmation this request cannot give.");
+    if (!result?.job) return null;
+    const finished = await jobs.wait(result.job.id);
+    if (finished.status !== "done") throw new Error(finished.error ?? "It was cancelled.");
+    return finished.affected ?? finished.count ?? finished.rows;
+  };
   server.handle(rpc.listAgentRequests, guard(async () => ({ requests: requests.list() })));
   server.handle(
     rpc.getAgentRequest,
     guard(async ({ id }: { id: string }) => {
       const request = requests.get(id);
-      return { request: requests.summaryOf(request), items: request.items };
+      // A drop or truncate needs the table's name typed by the person, as it does in the app.
+      const typeToConfirm = request.action?.name === "data.destroy" ? (request.action.input as { ref: ObjectRef }).ref.name : null;
+      return { request: requests.summaryOf(request), items: request.items, connectionProposal: request.connectionProposal, typeToConfirm };
     }),
   );
   server.handle(
     rpc.decideAgentRequest,
-    guard(async ({ id, approve }: RpcInput<typeof rpc.decideAgentRequest>) => {
-      const event = (action: AgentActivityEvent["action"], item: { agentId: string; agentTitle: string | null; connectionId: string; connectionName: string; place: string; rows: number; unit: AgentActivityEvent["unit"] }) => record({ agentId: item.agentId, agentTitle: item.agentTitle, connectionId: item.connectionId, connectionName: item.connectionName, action, place: item.place, rows: item.rows, unit: item.unit });
+    guard(async ({ id, approve, confirmName }: RpcInput<typeof rpc.decideAgentRequest>) => {
+      const event = (action: AgentActivityEvent["action"], item: { agentId: string; agentTitle: string | null; connectionId: string; connectionName: string; place: string; rows: number; unit: AgentActivityEvent["unit"]; headline?: string | null }) => record({ agentId: item.agentId, agentTitle: item.agentTitle, connectionId: item.connectionId, connectionName: item.connectionName, action, place: item.place, rows: item.rows, unit: item.unit, ...(item.headline ? { change: item.headline } : {}) });
       if (!approve) {
         const rejected = requests.reject(id);
         event("rejected", rejected);
         return requests.summaryOf(rejected);
       }
+      if (requests.get(id).kind === "connection") throw new Error("Approve this by saving the connection in the form.");
       // Flipped first, so a second press cannot run it. Everything slow happens in the job, past the RPC limit.
       const request = requests.take(id);
+      if (request.kind === "action") {
+        event("approved", request);
+        jobs.start("write", null, async () => {
+          try {
+            const affected = await runApprovedAction(request, confirmName);
+            request.status = "done";
+            request.affected = affected;
+            event("done", request);
+            return { affected: affected ?? undefined };
+          } catch (error) {
+            request.status = "failed";
+            request.message = errorMessage(error);
+            event("failed", request);
+            throw error;
+          }
+        });
+        return requests.summaryOf(request);
+      }
       event("approved", request);
       jobs.start("write", null, async ({ signal }) => {
         try {

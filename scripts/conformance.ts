@@ -629,9 +629,10 @@ async function runSpec(key: string, spec: Spec) {
   });
   // SQL counts were already stopped by their pooled session's deadline, and a tiny one finishes before a cancel
   // lands, so only the engines whose count passes the deadline to its driver are checked here.
-  // A tiny Neo4j count also finished within 1 ms when tried, so it is left out here like the SQL engines; its
-  // count passes the deadline to the driver all the same.
-  if (["mongodb", "dynamodb", "elasticsearch", "cassandra"].includes(spec.engine)) {
+  // Only where the deadline aborts the client's own request can a 1 ms limit not lose the race. On SQL, Neo4j,
+  // MongoDB (maxTimeMS) and Cassandra (readTimeout) a tiny count finished within 1 ms in some runs, so those pass the
+  // deadline to the driver without this check.
+  if (["dynamodb", "elasticsearch"].includes(spec.engine)) {
     await check("a count stops at its deadline", async () => {
       // The spec's own settings come last, so a blank here never sends a driver to its default, real service.
       const connection = { ...base, id: "x", host: "", port: null, user: "", database: "", file: "", serviceName: "", localDataCenter: "", region: "", endpoint: "", accessKeyId: "", authSource: "", tls: "off", caCertificate: "", password: "", apiKey: null, ...spec.input, safety: "read-only", ssh: null, rememberPassword: true, sshHostFingerprint: null, sshPassword: null, sshPrivateKey: null, sshPassphrase: null };

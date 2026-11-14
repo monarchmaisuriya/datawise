@@ -20,6 +20,7 @@ interface Job {
   view: JobView;
   controller: AbortController;
   finishedAt: number | null;
+  finished: Promise<JobView>;
 }
 
 // Every statement, write, count, import and export runs as a job the client polls. Paseo stops waiting
@@ -33,10 +34,11 @@ export class Jobs {
     const job: Job = {
       controller: new AbortController(),
       finishedAt: null,
+      finished: Promise.resolve(null as never),
       view: { id: randomUUID(), kind, status: "running", rows: 0, message: null, path, startedAt: new Date().toISOString(), results: null, affected: null, count: null, text: null, truncated: false, error: null },
     };
     this.jobs.set(job.view.id, job);
-        void Promise.resolve()
+    job.finished = Promise.resolve()
       .then(() =>
         work({
           signal: job.controller.signal,
@@ -64,7 +66,8 @@ export class Jobs {
       })
       .finally(() => {
         job.finishedAt = Date.now();
-      });
+      })
+      .then(() => job.view);
     return job.view;
   }
 
@@ -73,6 +76,13 @@ export class Jobs {
     // Jobs live in memory. Say what that means instead of a bare "not found": a write may have landed.
     if (!job) throw new Error("This job is gone, because the plugin restarted or too much time passed. If it was changing data, check the database before running it again.");
     return job.view;
+  }
+
+  // For a run an agent proposed: the request reports how the job ended, not that it started.
+  wait(id: string): Promise<JobView> {
+    const job = this.jobs.get(id);
+    if (!job) return Promise.reject(new Error("This job is gone."));
+    return job.finished;
   }
 
   cancel(id: string): void {

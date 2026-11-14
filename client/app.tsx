@@ -2,11 +2,12 @@ import type { PluginSurfaceProps, PluginTab } from "@getpaseo/plugin/client";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
-import { type AgentOpenEvent, type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
+import { type AgentOpenEvent, type ConnectionProposal, type ConnectionView, type Filter, type ObjectInfo } from "../shared/contracts";
 import { onAgentOpen, productionQuestion, takeAgentOpen } from "./agent-open";
 import { ENGINES } from "../shared/engines";
 import { AgentRequestsModal, usePendingAgentRequests } from "./agent-requests";
 import { ConnectionForm, ConnectionList, UnlockPrompt } from "./connections";
+import { proposalNote } from "./proposal-note";
 import { DataTab, type JumpTarget } from "./data-tab";
 import { Btn, ConfirmProvider, connectionColorValue, errorText, Pill, Segmented, type Theme, UiProvider, useApi, useConfirm, useUi } from "./kit";
 import { PendingProvider, usePending } from "./pending";
@@ -70,6 +71,7 @@ function Main({ surface, workspaceId }: { surface: string; workspaceId?: string 
   // Waits here until the connection can be used, as a session-only password may have to be asked for first.
   const [objectToRestore, setObjectToRestore] = useState<ObjectInfo | null>(null);
   const [agentRequestsOpen, setAgentRequestsOpen] = useState(false);
+  const [reviewing, setReviewing] = useState<{ requestId: string; connectionId: string | null; values: ConnectionProposal } | null>(null);
   const waitingRequests = usePendingAgentRequests();
 
   const list = connections.data?.connections ?? [];
@@ -229,7 +231,31 @@ function Main({ surface, workspaceId }: { surface: string; workspaceId?: string 
           <Btn label="Review" on onPress={() => setAgentRequestsOpen(true)} />
         </View>
       ) : null}
-      {agentRequestsOpen ? <AgentRequestsModal onClose={() => setAgentRequestsOpen(false)} /> : null}
+      {agentRequestsOpen ? (
+        <AgentRequestsModal
+          onClose={() => setAgentRequestsOpen(false)}
+          onReview={(requestId, reviewedId, values) => {
+            setAgentRequestsOpen(false);
+            setReviewing({ requestId, connectionId: reviewedId, values });
+          }}
+        />
+      ) : null}
+      {reviewing ? (
+        <ConnectionForm
+          connection={list.find((item) => item.id === reviewing.connectionId) ?? null}
+          proposal={{ requestId: reviewing.requestId, values: reviewing.values }}
+          note={proposalNote(reviewing.values, list.find((item) => item.id === reviewing.connectionId) ?? null)}
+          onClose={() => setReviewing(null)}
+          onSaved={() => {
+            setReviewing(null);
+            void connections.refetch();
+          }}
+          onDeleted={() => {
+            setReviewing(null);
+            void connections.refetch();
+          }}
+        />
+      ) : null}
       {connection?.needsPassword ? <UnlockPrompt connection={connection} onDone={() => connections.refetch()} onCancel={() => setConnectionId(null)} /> : null}
       {ui.compact ? (
         showContent ? content : rail

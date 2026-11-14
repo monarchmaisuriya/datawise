@@ -6,6 +6,7 @@ import { DatawiseApp } from "./client/app";
 import { SqlFilePanel, SqliteFilePanel } from "./client/file-panels";
 import { SettingsScreen } from "./client/settings-screen";
 import { receiveAgentOpen } from "./client/agent-open";
+import { receiveAgentChange } from "./client/agent-push";
 import { rpc, structureAttachment, subscriptions } from "./shared/contracts";
 
 const REOPEN_AFTER_MS = 5000;
@@ -54,6 +55,10 @@ export default function contribute(client: PluginClientContext) {
       subscriptions.agentOpens,
       {},
       (event) => {
+        if ("kind" in event) {
+          receiveAgentChange(event);
+          return;
+        }
         if (!receiveAgentOpen(event)) return;
         try {
           client.openPanel("browser", { workspaceId: event.workspaceId });

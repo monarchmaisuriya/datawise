@@ -90,6 +90,11 @@ export class Pool {
     }
   }
 
+  // True while a query, import, export or other job holds the connection. Checked outside use(), which counts too.
+  isBusy(connectionId: string): boolean {
+    return (this.live.get(connectionId)?.busy ?? 0) > 0;
+  }
+
   async disconnect(connectionId: string): Promise<void> {
     const entry = this.live.get(connectionId);
     if (!entry) return;
