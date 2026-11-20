@@ -139,10 +139,13 @@ export function contributeServer(host: Pick<PluginServerContext, "handle" | "reg
   // Connections an agent's test failed on; it may not test them again until the person tests or saves them.
   const agentTestFailures = new Set<string>();
   const agentTools = createAgentTools(store, pool, requests, logAgent, openInTab, { handlers, agentTestFailures, jobs, pushToWindows });
-  // Declared once, with the same list for every session, so changing what is shared never makes sessions reopen.
-  // Each tool checks the connection on every call. The handler does no work, because one that throws would stop
-  // every agent on the daemon from opening a session.
-  const removeAgentHook = server.addHook("agent.open.before", async ({ request }) => ({ ...request, tools: [...request.tools, ...agentTools] }));
+  // Keep one prebuilt catalog and one hook, so sharing changes do not reopen sessions. Only host delivery/policy
+  // filters the list here, without I/O; each tool still checks the connection on every call.
+  const removeAgentHook = server.addHook("agent.open.before", async ({ request }) => {
+    const attached = request.openSupport?.attachedTools;
+    if (request.purpose === "history" || !attached?.enabled || (attached.delivery !== "native" && attached.delivery !== "mcp")) return request;
+    return { ...request, tools: [...request.tools, ...agentTools.filter((tool) => !attached.disabledTools.includes(tool.name))] };
+  });
 
   // Sockets die, and a driver event with no listener would otherwise end this process and every job in
   // it. Log it, without details that could hold a secret, and let the pool rebuild on the next request.

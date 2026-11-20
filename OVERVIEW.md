@@ -33,7 +33,7 @@ Installing needs `npm` on the daemon machine's path, which fetches the database 
 
 The plugin runs on the daemon machine and connects from there, to the hosts you give it. Nothing else is contacted. Agents get nothing unless you open a connection to them.
 
-**Agent access is off by default, and each level is your choice, per connection.** Datawise's tools are offered to every agent on the daemon, because Paseo offers no reliable way to limit them to one agent; a tool asked about a connection not shared at its level answers the same as for a name that does not exist. Paseo only passes plugin tools to agents while its "Enable Paseo tools" host setting is on. A connection labelled production is always refused, except for opening a tab, which asks you first.
+**Agent access is off by default, and each level is your choice, per connection.** Offering a tool does not share a connection. A tool asked about a connection not shared at its level answers the same as for a name that does not exist. A connection labelled production is always refused, except for opening a tab, which asks you first. [Agent tool availability](#agent-tool-availability) describes which sessions receive the tools.
 
 - **Open in a tab:** `datawise_open` needs no sharing. It asks every open Paseo window to show a connection in the agent's workspace tab, optionally at a table, or with query text in a query tab. It never contacts the database, never runs the text, and returns no names or data. For a production connection no window moves: "Open a production connection?" waits in that workspace's Datawise tab for 30 minutes, and nothing opens unless you say yes. Moving away from pending edits asks first, as it does when you move yourself. With no Paseo window open, the tab opens there the next time Datawise is opened in that workspace, without the query text, and a production request is dropped. One request per agent every 5 seconds.
 - **Names and types:** `datawise_describe` returns table names, column names, types, nullability, keys and foreign key targets, on all 12 engines. It never returns rows, defaults, definitions or the values of an enum. On MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB and Neo4j, names come from your data: collection, key, index or label names, and field names seen in recent records. Names can hold text someone else wrote, so the tool tells agents to treat them as data.
@@ -76,6 +76,19 @@ Saved views and query tabs are in `views.json` and `workspace.json` in the same 
 
 Anyone with the daemon's manage permission can use saved connections, without seeing their passwords.
 
+## Agent tool availability
+
+Datawise builds one fixed tool catalog at startup and registers one session-open hook. At each open, that hook filters the catalog synchronously from Paseo's read-only support descriptor. It does not read connections, preferences or files, open a database, or change sharing. This is the bounded revision to [ADR 0002](docs/adr/0002-agent-tools-for-every-agent.md) recorded in [ADR 0004](docs/adr/0004-filter-agent-tools-by-session-delivery.md).
+
+| Session state | Datawise adds |
+| --- | --- |
+| Native or host MCP attached-tool delivery, with Paseo tools enabled | The fixed catalog, except exact tool names in the host's disabled list |
+| Native delivery without external HTTP MCP, instructions or exact preapproval | The same eligible catalog; those capabilities are independent |
+| Paseo tools disabled, missing support descriptor, or delivery unknown/unavailable | No Datawise tools |
+| History-only open | No Datawise tools |
+
+At the next eligible open or refresh, the same tool definitions return. A limited session does not change another session or saved connections, queries, preferences or approvals. Changing connection sharing still takes effect at each tool call without replacing the hook or reopening sessions. Delivery support never grants connection access or approves a proposed change; the rules above still apply.
+
 ## Limits
 
 - Two people editing the same value: the last write wins. Redis list edits are the exception, and are refused if the entry moved. Pending edits compare each value before writing, which leaves a brief window between that read and the write.
@@ -94,3 +107,5 @@ Anyone with the daemon's manage permission can use saved connections, without se
 - SQLite needs Node 22.5 or later on the daemon, which the Paseo desktop app includes. A SQLite file must already exist.
 
 Requires Paseo 0.16.0-beta.2 or later.
+
+The unreleased adaptive source additionally requires a host advertising `adaptiveAgentFeatures` and stops setup with update guidance if it is absent. The manifest and SDK pin still describe the published release; a matching local SDK is needed for source verification. A released host/SDK version must be assigned and the metadata aligned before publication. See [README](README.md#develop).

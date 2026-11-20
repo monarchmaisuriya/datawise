@@ -3,6 +3,7 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PluginOpenSupport } from "@getpaseo/plugin/server";
 import { z, type ZodType } from "zod";
 import { type ConnectionInput, type JobView, type Filter, type ObjectRef, type RowPage, rpc, searchStructure, type StartResult, BYTES_SIZE, BYTES_TAG } from "../shared/contracts";
 import { jumpFilters } from "../shared/foreign-keys";
@@ -478,7 +479,16 @@ const handlers = new Map<string, (input: unknown) => Promise<unknown>>();
 // Stands in for the daemon's settings store and hook registry, so the suite can drive both.
 let preferenceValues: Record<string, unknown> = {};
 const preferenceListeners = new Set<(next: { status: string; values: unknown }) => void>();
-const hookHandlers = new Set<(input: { request: { tools: unknown[] } }) => Promise<{ tools: { name: string; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> }[] }>>();
+const openSupport: PluginOpenSupport = {
+  adapter: { kind: "plugin", id: "conformance-provider" },
+  instructions: "supported",
+  mcpHttp: "supported",
+  exactMcpPreapproval: "supported",
+  attachedTools: { delivery: "mcp", enabled: true, disabledTools: [] },
+  restrictions: { mcpConfiguration: "mutable", processEnvironment: "mutable" },
+  providerOptions: [],
+};
+const hookHandlers = new Set<(input: { request: { purpose: "interactive"; openSupport: PluginOpenSupport; tools: unknown[] } }) => Promise<{ tools: { name: string; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> }[] }>>();
 const folder = mkdtempSync(join(tmpdir(), "datawise-conformance-"));
 const cleanup = contributeServer(
   {
@@ -867,7 +877,7 @@ async function runSpec(key: string, spec: Spec) {
     const use = async (name: string, input: Record<string, unknown>) => {
       const hook = theHook();
       if (!hook) throw new Error("no hook registered");
-      const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+      const tool = (await hook({ request: { purpose: "interactive", openSupport, tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
       return tool.execute(tool.input.parse({ connection: shared.name, ...spec.scope, ...input }), agent);
     };
     try {
@@ -907,7 +917,7 @@ async function runSpec(key: string, spec: Spec) {
       try {
         const hook = theHook();
         if (!hook) throw new Error("no hook registered");
-        const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === "datawise_read") as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+        const tool = (await hook({ request: { purpose: "interactive", openSupport, tools: [] } })).tools.find((item) => item.name === "datawise_read") as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
         const seen: string[] = [];
         let cursor: string | null = null;
         for (let page = 0; page < 50; page += 1) {
@@ -932,7 +942,7 @@ async function runSpec(key: string, spec: Spec) {
       const use = async (name: string, input: Record<string, unknown>) => {
         const hook = theHook();
         if (!hook) throw new Error("no hook registered");
-        const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
+        const tool = (await hook({ request: { purpose: "interactive", openSupport, tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean }> };
         return tool.execute(tool.input.parse({ connection: shared.name, ...input }), agent);
       };
       // A view makes MongoDB keep system.views in this database.
@@ -1164,7 +1174,7 @@ function theHook() {
 async function describeTool() {
   const hook = theHook();
   if (!hook) throw new Error("no hook registered");
-  const answer = await hook({ request: { tools: [] } });
+  const answer = await hook({ request: { purpose: "interactive", openSupport, tools: [] } });
   const tool = answer.tools.find((item) => item.name === "datawise_describe");
   if (!tool) throw new Error("no tool in the hook's answer");
   return tool;
@@ -1324,7 +1334,7 @@ async function runEngineFeatures(key: string, spec: EngineFeatures) {
   const useTool = async (name: string, input: unknown, context: unknown = agentA) => {
     const hook = theHook();
     if (!hook) throw new Error("no hook registered");
-    const tool = (await hook({ request: { tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean; structuredContent?: { requestId: string; status: string } }> };
+    const tool = (await hook({ request: { purpose: "interactive", openSupport, tools: [] } })).tools.find((item) => item.name === name) as unknown as { input: ZodType; execute(input: unknown, context: unknown): Promise<{ text?: string; isError?: boolean; structuredContent?: { requestId: string; status: string } }> };
     return tool.execute(tool.input.parse(input), context);
   };
   const rowsConnection = (name: string, extra: Record<string, unknown> = {}) => call(rpc.saveConnection, { name, engine: spec.engine, safety: "confirm", environment: "development", agentAccess: "schema", agentRowAccess: "propose", ...spec.input, ...extra });

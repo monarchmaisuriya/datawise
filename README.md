@@ -8,6 +8,8 @@ Current release: **v0.7.0**. Datawise follows [Semantic Versioning](https://semv
 
 Requires Paseo 0.16.0-beta.2 or later, and `npm` on the daemon machine's `PATH`.
 
+**Unreleased source:** this checkout additionally requires a Paseo host that advertises `adaptiveAgentFeatures`. Older hosts stop plugin setup with update guidance. The release and dependency metadata still describe v0.7.0; the adaptive source needs the matching local SDK for development and is not release-ready on that SDK pin.
+
 ![The data view, showing a table of sample customers](assets/data.jpg)
 
 ![The query view, showing a SQL query and its results](assets/query.jpg)
@@ -35,7 +37,7 @@ Saved connections live in Paseo's `plugin-data/datawise` folder, so they stay in
 
 ## Agent tools
 
-Paseo agents get these tools while Paseo's "Enable Paseo tools" host setting is on. Each connection is shared with agents only if you choose, and never if it is labelled production. [OVERVIEW.md](OVERVIEW.md) has the full rules.
+Paseo agents get these tools when that session supports attached-tool delivery and Paseo's "Enable Paseo tools" host setting is on, except tools you explicitly disable. Each connection is shared with agents only if you choose, and never if it is labelled production. [OVERVIEW.md](OVERVIEW.md#agent-tool-availability) has the availability and per-call rules.
 
 | Tool | Needs | Does |
 | --- | --- | --- |
@@ -68,6 +70,10 @@ Paseo agents get these tools while Paseo's "Enable Paseo tools" host setting is 
 Deleting a connection, unlocking one with its password, and approving requests stay yours; [OVERVIEW.md](OVERVIEW.md) lists everything agents never get, and why.
 
 ## Develop
+
+For adaptive-source verification, prepare dependencies from this checkout's unchanged lockfile in an isolated dependency directory, then overlay locally built matching Paseo protocol, client and plugin SDK artifacts there. Keep that overlay local: do not commit absolute `file:` dependencies or change the release pins to a placeholder version. Run the typecheck and owning tests against that prepared SDK; installing or reloading the running plugin is not part of source verification.
+
+Use Node 24.22.1 for local SQLite safety verification (`server/agent-tools.test.ts`). The read-only SQLite child requires `DatabaseSync.setAuthorizer`, [added in Node 24.10.0](https://github.com/nodejs/node/blob/v24.22.1/doc/api/sqlite.md#databasesetauthorizercallback); Node 22.20.0 lacks that API. Keep the safety check enabled rather than working around it on an older runtime.
 
 ```bash
 npm install

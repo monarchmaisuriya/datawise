@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { PluginOpenSupport } from "@getpaseo/plugin/server";
 import { afterEach, describe, expect, it } from "vitest";
 import { setDriverRoot } from "./drivers";
 import { contributeServer } from "./plugin";
@@ -22,7 +23,16 @@ function start() {
   const folder = mkdtempSync(join(tmpdir(), "datawise-open-"));
   const handlers = new Map<string, Handler>();
   const inputs = new Map<string, { parse(value: unknown): unknown }>();
-  let hook: ((input: { request: { tools: Tool[] } }) => Promise<{ tools: Tool[] }>) | null = null;
+  const openSupport: PluginOpenSupport = {
+    adapter: { kind: "plugin", id: "test-provider" },
+    instructions: "supported",
+    mcpHttp: "supported",
+    exactMcpPreapproval: "supported",
+    attachedTools: { delivery: "mcp", enabled: true, disabledTools: [] },
+    restrictions: { mcpConfiguration: "mutable", processEnvironment: "mutable" },
+    providerOptions: [],
+  };
+  let hook: ((input: { request: { purpose: "interactive"; openSupport: PluginOpenSupport; tools: Tool[] } }) => Promise<{ tools: Tool[] }>) | null = null;
   const cleanup = contributeServer(
     {
       handle: (contract: { name: string; input: { parse(value: unknown): unknown } }, handler: Handler) => {
@@ -51,7 +61,7 @@ function start() {
     return () => controller.abort();
   };
   const use = async (name: string, input: unknown, agent: Record<string, unknown> = { id: "agent-a", title: "Agent A", workspaceId: "ws-1" }) => {
-    const tool = (await (hook as NonNullable<typeof hook>)({ request: { tools: [] } })).tools.find((item) => item.name === name) as Tool;
+    const tool = (await (hook as NonNullable<typeof hook>)({ request: { purpose: "interactive", openSupport, tools: [] } })).tools.find((item) => item.name === name) as Tool;
     return tool.execute(tool.input.parse(input), { agent });
   };
   const open = (input: unknown, agent?: Record<string, unknown>) => use("datawise_open", input, agent);
